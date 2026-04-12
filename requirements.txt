@@ -1,0 +1,15 @@
+# AutoStream Agent — Python Dependencies
+# Install with: pip install -r requirements.txt
+
+# ── Core LangChain / LangGraph ────────────────────────────────────────────────
+langchain>=0.3.0
+langchain-core>=0.3.0
+langgraph>=0.2.0
+
+# ── LLM Providers (install the one matching your LLM_PROVIDER) ───────────────
+langchain-anthropic>=0.2.0      # Claude 3 Haiku  (default)
+langchain-openai>=0.2.0         # GPT-4o-mini     (optional)
+langchain-google-genai>=2.0.0   # Gemini 1.5 Flash (optional)
+
+# ── Utilities ─────────────────────────────────────────────────────────────────
+python-dotenv>=1.0.0            # Load .env variables
