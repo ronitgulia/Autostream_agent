@@ -211,16 +211,18 @@ def lead_capture_node(state: AgentState) -> AgentState:
 
     # ── Stage: collecting_email ──────────────────────────────────────────────
     if stage == "collecting_email":
-        # Basic email validation
-        email_pattern = r'^[\w\.-]+@[\w\.-]+\.\w{2,}$'
-        if not re.match(email_pattern, last_human):
+        # Normalize: strip whitespace and lowercase so "User@Gmail.COM" works
+        email = last_human.strip().lower()
+        # Rejects: "riya@" (no domain), "notanemail" (no @), "x@y.c" (TLD < 2 chars)
+        email_pattern = r'^[\w\.-]+@[\w\.-]+\.\w{2,6}$'
+        if not re.match(email_pattern, email):
             return {
                 **state,
                 "messages": [AIMessage(content="Hmm, that doesn't look like a valid email. Could you double-check and re-enter it?")],
             }
         return {
             **state,
-            "lead_email": last_human,
+            "lead_email": email,          # store normalized email
             "lead_stage": "collecting_platform",
             "messages": [AIMessage(content="Got it! Last question — which platform do you primarily create content on?\n(e.g., YouTube, Instagram, TikTok, LinkedIn…)")],
         }
