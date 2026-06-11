@@ -7,6 +7,8 @@ Provides:
 
 import json
 import os
+import csv
+from datetime import datetime, timezone
 from pathlib import Path
 
 
@@ -70,19 +72,42 @@ def retrieve_knowledge(query: str) -> str:
     return "\n".join(results)
 
 
-# ── Tool 2: Mock Lead Capture ────────────────────────────────────────────────
+# ── Tool 2: Lead Capture (persists to leads.csv) ────────────────────────────
+
+_LEADS_CSV = Path(__file__).parent.parent / "leads.csv"
+_CSV_HEADERS = ["timestamp", "name", "email", "platform"]
+
+def _append_lead_to_csv(name: str, email: str, platform: str) -> None:
+    """Write one lead row to leads.csv, creating the file with headers if needed."""
+    file_exists = _LEADS_CSV.exists()
+    with open(_LEADS_CSV, "a", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        if not file_exists:
+            writer.writerow(_CSV_HEADERS)   # write header only on first run
+        writer.writerow([
+            datetime.now(timezone.utc).isoformat(),
+            name,
+            email,
+            platform,
+        ])
+
 
 def mock_lead_capture(name: str, email: str, platform: str) -> str:
     """
-    Simulate sending lead data to a CRM / backend system.
-    In production this would be an HTTP POST to a real API.
+    Capture lead data and persist it to leads.csv.
+    In production this would also POST to a real CRM API.
     """
+    # ── Persist to CSV ───────────────────────────────────────────────────────
+    _append_lead_to_csv(name, email, platform)
+
+    # ── Console confirmation ─────────────────────────────────────────────────
     print(f"\n{'='*55}")
-    print(f"  ✅  LEAD CAPTURED SUCCESSFULLY")
+    print(f"  ✅  LEAD CAPTURED & SAVED TO leads.csv")
     print(f"{'='*55}")
     print(f"  Name     : {name}")
     print(f"  Email    : {email}")
     print(f"  Platform : {platform}")
+    print(f"  Saved to : {_LEADS_CSV}")
     print(f"{'='*55}\n")
 
     return (
