@@ -62,8 +62,14 @@ def run_cli():
         state = {**state, "messages": state["messages"] + [HumanMessage(content=user_input)]}
 
         # Run one step of the graph
-        result = graph.invoke(state)
-        state = result  # persist updated state (memory across turns)
+        try:
+            result = graph.invoke(state)
+            state = result  # persist updated state (memory across turns)
+        except Exception as e:
+            print(f"\nAgent: Oops, something went wrong — {e}\n")
+            # Roll back the last human message so the user can retry
+            state = {**state, "messages": state["messages"][:-1]}
+            continue
 
         # Print latest AI message
         last_ai = next(
