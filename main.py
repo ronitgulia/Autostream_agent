@@ -18,7 +18,7 @@ from pathlib import Path
 # Allow imports from project root
 sys.path.insert(0, str(Path(__file__).parent))
 
-from langchain_core.messages import HumanMessage
+from langchain_core.messages import HumanMessage, AIMessage
 from agent.agent import build_graph, AgentState
 
 
@@ -68,7 +68,7 @@ def run_cli():
         # Print latest AI message
         last_ai = next(
             (m.content for m in reversed(state["messages"])
-             if hasattr(m, "type") and m.type == "ai"),
+             if isinstance(m, AIMessage)),
             "(no response)"
         )
         print(f"\nAgent: {last_ai}\n")
