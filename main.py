@@ -12,6 +12,7 @@ Environment variables (set in .env):
 
 import sys
 import os
+import copy
 from pathlib import Path
 
 # Allow imports from project root
@@ -42,7 +43,7 @@ INITIAL_STATE: AgentState = {
 def run_cli():
     print(BANNER)
     graph = build_graph()
-    state = INITIAL_STATE.copy()
+    state = copy.deepcopy(INITIAL_STATE)
 
     while True:
         try:
