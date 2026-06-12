@@ -6,21 +6,28 @@ Architecture:
   ┌─────────────┐     ┌──────────────────┐     ┌───────────────┐
   │  User Input │────▶│  Intent Detector │────▶│  Router Node  │
   └─────────────┘     └──────────────────┘     └───────┬───────┘
-                                                        │
+                                                         │
                         ┌───────────────────────────────┼─────────────────────┐
                         ▼                               ▼                     ▼
                ┌────────────────┐           ┌───────────────────┐   ┌──────────────────┐
                │  Greeter Node  │           │  RAG Answer Node  │   │  Lead Capture    │
                └────────────────┘           └───────────────────┘   │  Node (3-step)   │
                                                                      └──────────────────┘
+
+Improvements:
+  - AgentState backed by Pydantic BaseModel for runtime validation & coercion.
+  - Lead model uses EmailStr for declarative email validation (no manual regex).
+  - Intent detection uses .with_structured_output(IntentResponse) so the LLM
+    returns a typed Enum, eliminating string-parsing fragility.
 """
 
 import os
-import re
-from typing import TypedDict, Annotated, Literal
+from enum import Enum
+from typing import Annotated, Literal, List
 from dotenv import load_dotenv
 
-from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
+from pydantic import BaseModel, EmailStr, field_validator, ConfigDict
+from langchain_core.messages import HumanMessage, AIMessage, SystemMessage, BaseMessage
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langgraph.graph import StateGraph, END
 from langgraph.graph.message import add_messages
@@ -69,64 +76,97 @@ def _build_llm():
 llm = _build_llm()
 
 
-# ── Agent State ───────────────────────────────────────────────────────────────
+# ── Lead Model (Pydantic) ────────────────────────────────────────────────────
 
-class AgentState(TypedDict):
-    messages: Annotated[list, add_messages]          # full conversation history
-    intent: str                                       # "greeting" | "product_inquiry" | "high_intent"
-    lead_stage: str                                   # "none" | "collecting_name" | "collecting_email" | "collecting_platform" | "done"
-    lead_name: str
-    lead_email: str
-    lead_platform: str
-    rag_context: str                                  # retrieved knowledge for current turn
+class Lead(BaseModel):
+    """Validated lead data collected during the sign-up flow."""
+    name: str = ""
+    email: str = ""     # raw string; validation is done via _EmailCheck before storing
+    platform: str = ""
+
+    @field_validator("email", mode="before")
+    @classmethod
+    def normalise_email(cls, v: str) -> str:
+        """Lowercase + strip whitespace before storing."""
+        return v.strip().lower() if isinstance(v, str) else v
 
 
-# ── Intent Detection ─────────────────────────────────────────────────────────
+class _EmailCheck(BaseModel):
+    """Single-purpose model used only to validate an email string via EmailStr.
+    EmailStr raises ValidationError on malformed input — we catch that upstream.
+    """
+    email: EmailStr
+
+    @field_validator("email", mode="before")
+    @classmethod
+    def normalise(cls, v: str) -> str:
+        return v.strip().lower() if isinstance(v, str) else v
+
+
+# ── Intent Schema (Structured Output) ────────────────────────────────────────
+
+class Intent(str, Enum):
+    greeting        = "greeting"
+    product_inquiry = "product_inquiry"
+    high_intent     = "high_intent"
+
+class IntentResponse(BaseModel):
+    """Structured output the LLM must return for intent classification."""
+    intent: Intent
+
+
+# ── Agent State (Pydantic) ────────────────────────────────────────────────────
+
+class AgentState(BaseModel):
+    """Full runtime state of the AutoStream agent, validated by Pydantic."""
+    model_config = ConfigDict(arbitrary_types_allowed=True)  # needed for LangChain BaseMessage
+
+    messages: Annotated[List[BaseMessage], add_messages] = []  # full conversation history
+    intent: Intent = Intent.greeting                            # current classified intent
+    lead_stage: Literal[
+        "none", "collecting_name", "collecting_email",
+        "collecting_platform", "done"
+    ] = "none"                                                  # lead capture FSM state
+    lead: Lead = Lead()                                         # validated lead data
+    rag_context: str = ""                                       # retrieved knowledge for current turn
+
+
+# ── Intent Detection (Structured Output) ─────────────────────────────────────
 
 _INTENT_PROMPT = """You are an intent classifier for AutoStream, a video editing SaaS.
 Classify the user's latest message into exactly ONE of these intents:
 
-1. greeting        — casual hello, how are you, general chit-chat
-2. product_inquiry — questions about features, pricing, plans, policies, or how AutoStream works
-3. high_intent     — user explicitly wants to sign up, start a trial, buy a plan, or try the product
+- greeting        — casual hello, how are you, general chit-chat
+- product_inquiry — questions about features, pricing, plans, policies, or how AutoStream works
+- high_intent     — user explicitly wants to sign up, start a trial, buy a plan, or try the product"""
 
-Respond with ONLY the intent label (no explanation, no punctuation):
-greeting | product_inquiry | high_intent
-"""
+# The LLM is bound to return a valid IntentResponse — no string parsing needed.
+_intent_llm = llm.with_structured_output(IntentResponse)
 
 def detect_intent(state: AgentState) -> AgentState:
-    """Classify user intent from latest message."""
+    """Classify user intent via structured LLM output (no regex / string parsing)."""
     last_human = next(
-        (m.content for m in reversed(state["messages"]) if isinstance(m, HumanMessage)),
+        (m.content for m in reversed(state.messages) if isinstance(m, HumanMessage)),
         ""
     )
 
-    response = llm.invoke([
+    result: IntentResponse = _intent_llm.invoke([
         SystemMessage(content=_INTENT_PROMPT),
         HumanMessage(content=last_human),
     ])
-    raw = response.content.strip().lower()
 
-    # Normalise
-    if "high" in raw or "sign" in raw or "buy" in raw:
-        intent = "high_intent"
-    elif "product" in raw or "inquiry" in raw:
-        intent = "product_inquiry"
-    else:
-        intent = "greeting"
-
-    return {**state, "intent": intent}
+    return state.model_copy(update={"intent": result.intent})
 
 
 # ── Router ────────────────────────────────────────────────────────────────────
 
 def route(state: AgentState) -> Literal["greeter", "rag_answer", "lead_capture"]:
     """Decide which node handles this turn."""
-    if state["lead_stage"] not in ("none", "done"):
+    if state.lead_stage not in ("none", "done"):
         return "lead_capture"
-    if state["intent"] == "high_intent":
+    if state.intent == Intent.high_intent:
         return "lead_capture"
-    if state["intent"] == "product_inquiry":
+    if state.intent == Intent.product_inquiry:
         return "rag_answer"
     return "greeter"
 
@@ -142,9 +182,9 @@ mention you'd be happy to share pricing details or help them get started."""
 def greeter_node(state: AgentState) -> AgentState:
     response = llm.invoke([
         SystemMessage(content=_GREETER_SYSTEM),
-        *state["messages"],
+        *state.messages,
     ])
-    return {**state, "messages": [AIMessage(content=response.content)]}
+    return state.model_copy(update={"messages": [AIMessage(content=response.content)]})
 
 
 # ── Node: RAG Answer ──────────────────────────────────────────────────────────
@@ -161,7 +201,7 @@ KNOWLEDGE BASE CONTEXT:
 
 def rag_answer_node(state: AgentState) -> AgentState:
     last_human = next(
-        (m.content for m in reversed(state["messages"]) if isinstance(m, HumanMessage)),
+        (m.content for m in reversed(state.messages) if isinstance(m, HumanMessage)),
         ""
     )
     context = retrieve_knowledge(last_human)
@@ -169,19 +209,18 @@ def rag_answer_node(state: AgentState) -> AgentState:
     prompt = _RAG_SYSTEM.format(context=context)
     response = llm.invoke([
         SystemMessage(content=prompt),
-        *state["messages"],
+        *state.messages,
     ])
-    return {
-        **state,
+    return state.model_copy(update={
         "rag_context": context,
         "messages": [AIMessage(content=response.content)],
-    }
+    })
 
 
 # ── Node: Lead Capture ────────────────────────────────────────────────────────
 
 def lead_capture_node(state: AgentState) -> AgentState:
-    stage = state["lead_stage"]
+    stage = state.lead_stage
 
     # ── Stage: none → start collection ──────────────────────────────────────
     if stage == "none":
@@ -189,66 +228,64 @@ def lead_capture_node(state: AgentState) -> AgentState:
             "Great to hear you're interested in AutoStream Pro! 🎉\n\n"
             "I'd love to get you set up. Could I start with your **full name**?"
         )
-        return {
-            **state,
+        return state.model_copy(update={
             "lead_stage": "collecting_name",
             "messages": [AIMessage(content=msg)],
-        }
+        })
 
     last_human = next(
-        (m.content for m in reversed(state["messages"]) if isinstance(m, HumanMessage)),
+        (m.content for m in reversed(state.messages) if isinstance(m, HumanMessage)),
         ""
     ).strip()
 
     # ── Stage: collecting_name ───────────────────────────────────────────────
     if stage == "collecting_name":
-        return {
-            **state,
-            "lead_name": last_human,
+        updated_lead = state.lead.model_copy(update={"name": last_human})
+        return state.model_copy(update={
+            "lead": updated_lead,
             "lead_stage": "collecting_email",
             "messages": [AIMessage(content=f"Nice to meet you, **{last_human}**! 👋\n\nWhat's your **email address**?")],
-        }
+        })
 
     # ── Stage: collecting_email ──────────────────────────────────────────────
     if stage == "collecting_email":
-        # Normalize: strip whitespace and lowercase so "User@Gmail.COM" works
-        email = last_human.strip().lower()
-        # Rejects: "riya@" (no domain), "notanemail" (no @), "x@y.c" (TLD < 2 chars)
-        email_pattern = r'^[\w\.-]+@[\w\.-]+\.\w{2,6}$'
-        if not re.match(email_pattern, email):
-            return {
-                **state,
+        # Use the dedicated _EmailCheck model (strict EmailStr) for validation.
+        # Lead.email is a plain str field, so we validate here before storing.
+        from pydantic import ValidationError
+        try:
+            _EmailCheck(email=last_human)   # raises ValidationError if malformed
+        except ValidationError:
+            return state.model_copy(update={
                 "messages": [AIMessage(content="Hmm, that doesn't look like a valid email. Could you double-check and re-enter it?")],
-            }
-        return {
-            **state,
-            "lead_email": email,          # store normalized email
+            })
+        updated_lead = state.lead.model_copy(update={"email": last_human})
+        return state.model_copy(update={
+            "lead": updated_lead,
             "lead_stage": "collecting_platform",
             "messages": [AIMessage(content="Got it! Last question — which platform do you primarily create content on?\n(e.g., YouTube, Instagram, TikTok, LinkedIn…)")],
-        }
+        })
 
     # ── Stage: collecting_platform → fire tool ───────────────────────────────
     if stage == "collecting_platform":
-        platform = last_human
-        name = state["lead_name"]
-        email = state["lead_email"]
-
-        result = mock_lead_capture(name=name, email=email, platform=platform)
-
-        return {
-            **state,
-            "lead_platform": platform,
+        updated_lead = state.lead.model_copy(update={"platform": last_human})
+        result = mock_lead_capture(
+            name=updated_lead.name,
+            email=str(updated_lead.email),
+            platform=updated_lead.platform,
+        )
+        return state.model_copy(update={
+            "lead": updated_lead,
             "lead_stage": "done",
             "messages": [AIMessage(content=result)],
-        }
+        })
 
     # ── Stage: done — follow-up conversation ─────────────────────────────────
     response = llm.invoke([
         SystemMessage(content="You are Alex from AutoStream. The user has already signed up as a lead. "
                                "Be warm, answer any remaining questions, and let them know the team will be in touch."),
-        *state["messages"],
+        *state.messages,
     ])
-    return {**state, "messages": [AIMessage(content=response.content)]}
+    return state.model_copy(update={"messages": [AIMessage(content=response.content)]})
 
 
 # ── Build LangGraph ───────────────────────────────────────────────────────────

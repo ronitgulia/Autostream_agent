@@ -29,15 +29,7 @@ BANNER = """
 ╚══════════════════════════════════════════════════════════╝
 """
 
-INITIAL_STATE: AgentState = {
-    "messages": [],
-    "intent": "greeting",
-    "lead_stage": "none",
-    "lead_name": "",
-    "lead_email": "",
-    "lead_platform": "",
-    "rag_context": "",
-}
+INITIAL_STATE = AgentState()
 
 
 def run_cli():
@@ -59,7 +51,7 @@ def run_cli():
             break
 
         # Append user message to state
-        state = {**state, "messages": state["messages"] + [HumanMessage(content=user_input)]}
+        state = state.model_copy(update={"messages": state.messages + [HumanMessage(content=user_input)]})
 
         # Run one step of the graph
         try:
@@ -68,12 +60,12 @@ def run_cli():
         except Exception as e:
             print(f"\nAgent: Oops, something went wrong — {e}\n")
             # Roll back the last human message so the user can retry
-            state = {**state, "messages": state["messages"][:-1]}
+            state = state.model_copy(update={"messages": state.messages[:-1]})
             continue
 
         # Print latest AI message
         last_ai = next(
-            (m.content for m in reversed(state["messages"])
+            (m.content for m in reversed(state.messages)
              if isinstance(m, AIMessage)),
             "(no response)"
         )

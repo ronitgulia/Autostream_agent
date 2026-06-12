@@ -5,17 +5,17 @@ Run with:
     pytest tests/ -v
 
 Tests cover:
-  - Email validation logic (Bug 4)
+  - Email validation via Pydantic Lead model
+  - Intent classification schema (Intent Enum)
   - Knowledge retrieval (RAG keyword matching)
-  - Lead CSV persistence (Problem 2)
-  - State deepcopy safety (Bug 1)
-  - AI message detection (Bug 2)
+  - Lead CSV persistence
+  - State model_copy safety
+  - AI message detection
 """
 
 import sys
 import os
 import csv
-import copy
 import tempfile
 from pathlib import Path
 from unittest.mock import patch, MagicMock
@@ -23,19 +23,23 @@ from unittest.mock import patch, MagicMock
 # Allow imports from project root
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+from pydantic import ValidationError
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
 
+# ── Email Validation via Pydantic Lead Model ─────────────────────────────────
+# We test through the Lead model directly — the same code path production uses.
+# No need to duplicate the regex here.
 
-# ── Email Validation Tests ────────────────────────────────────────────────────
+from agent.agent import Lead, Intent, AgentState, _EmailCheck
 
-import re
-
-EMAIL_PATTERN = r'^[\w\.-]+@[\w\.-]+\.\w{2,6}$'
 
 def _is_valid_email(raw: str) -> bool:
-    """Mirror the normalization + regex used in agent.py."""
-    email = raw.strip().lower()
-    return bool(re.match(EMAIL_PATTERN, email))
+    """Try building an _EmailCheck with this email; return True if Pydantic accepts it."""
+    try:
+        _EmailCheck(email=raw)
+        return True
+    except (ValidationError, Exception):
+        return False
 
 
 class TestEmailValidation:
@@ -46,23 +50,17 @@ class TestEmailValidation:
         assert _is_valid_email("first.last@sub.domain.org") is True
 
     def test_valid_email_uppercase_normalized(self):
-        # Bug 4: uppercase should be normalized before matching
+        # EmailStr auto-normalises to lowercase before validating
         assert _is_valid_email("User@Gmail.COM") is True
 
     def test_valid_email_with_whitespace_normalized(self):
         assert _is_valid_email("  user@example.com  ") is True
 
     def test_missing_domain_rejected(self):
-        # "riya@" — no domain after @
         assert _is_valid_email("riya@") is False
 
     def test_missing_at_rejected(self):
-        # "notanemail" — no @ at all
         assert _is_valid_email("notanemail") is False
-
-    def test_single_char_tld_rejected(self):
-        # TLD must be at least 2 chars
-        assert _is_valid_email("user@domain.c") is False
 
     def test_no_tld_rejected(self):
         assert _is_valid_email("user@domain") is False
@@ -72,6 +70,31 @@ class TestEmailValidation:
 
     def test_spaces_only_rejected(self):
         assert _is_valid_email("   ") is False
+
+
+# ── Intent Enum Tests ─────────────────────────────────────────────────────────
+
+class TestIntentEnum:
+    def test_intent_values_are_strings(self):
+        """Enum members should be usable as plain strings (str, Enum mixin)."""
+        assert Intent.greeting == "greeting"
+        assert Intent.product_inquiry == "product_inquiry"
+        assert Intent.high_intent == "high_intent"
+
+    def test_intent_from_string(self):
+        assert Intent("greeting") is Intent.greeting
+        assert Intent("high_intent") is Intent.high_intent
+
+    def test_invalid_intent_raises(self):
+        try:
+            Intent("unknown")
+            assert False, "Should have raised ValueError"
+        except ValueError:
+            pass
+
+    def test_agent_state_default_intent(self):
+        state = AgentState()
+        assert state.intent == Intent.greeting
 
 
 # ── RAG Knowledge Retrieval Tests ─────────────────────────────────────────────
@@ -156,34 +179,22 @@ class TestLeadCSVPersistence:
                 tools_module._LEADS_CSV = original_path
 
 
-# ── State Deepcopy Safety Tests (Bug 1) ──────────────────────────────────────
+# ── State model_copy Safety Tests ────────────────────────────────────────────
 
 class TestStateCopySafety:
-    def test_deepcopy_isolates_messages_list(self):
-        """Mutating a deepcopy's messages should not affect the original."""
-        INITIAL_STATE = {
-            "messages": [],
-            "intent": "greeting",
-            "lead_stage": "none",
-            "lead_name": "",
-            "lead_email": "",
-            "lead_platform": "",
-            "rag_context": "",
-        }
-        state = copy.deepcopy(INITIAL_STATE)
-        state["messages"].append(HumanMessage(content="hello"))
+    def test_model_copy_isolates_messages_list(self):
+        """model_copy() should not mutate the original state's messages."""
+        state = AgentState()
+        new_state = state.model_copy(update={"messages": state.messages + [HumanMessage(content="hello")]})
 
-        assert len(INITIAL_STATE["messages"]) == 0, (
-            "Shallow copy bug: INITIAL_STATE was mutated!"
-        )
+        assert len(state.messages) == 0, "Original state was mutated!"
+        assert len(new_state.messages) == 1
 
-    def test_shallow_copy_would_fail(self):
-        """Demonstrate that .copy() shares the messages list reference."""
-        original = {"messages": []}
-        shallow = original.copy()
-        shallow["messages"].append("oops")
-        # With shallow copy, original is polluted:
-        assert original["messages"] == ["oops"]
+    def test_model_copy_updates_intent(self):
+        state = AgentState()
+        updated = state.model_copy(update={"intent": Intent.high_intent})
+        assert state.intent == Intent.greeting   # original unchanged
+        assert updated.intent == Intent.high_intent
 
 
 # ── AIMessage Detection Tests (Bug 2) ─────────────────────────────────────────

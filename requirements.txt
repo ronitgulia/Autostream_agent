@@ -9,7 +9,11 @@ langgraph>=0.2.0
 # ── LLM Providers (install the one matching your LLM_PROVIDER) ───────────────
 langchain-anthropic>=0.2.0      # Claude 3 Haiku  (default)
 langchain-openai>=0.2.0         # GPT-4o-mini     (optional)
-langchain-google-genai>=2.0.0   # Gemini 1.5 Flash (optional)
+langchain-google-genai>=2.0.0   # Gemini 2.0 Flash (optional)
+langchain-groq>=0.1.0           # Llama-3.3-70b   (optional)
+
+# ── Data Validation ───────────────────────────────────────────────────────────
+pydantic[email]>=2.0.0          # EmailStr for Lead model (requires email-validator)
 
 # ── Utilities ─────────────────────────────────────────────────────────────────
 python-dotenv>=1.0.0            # Load .env variables
