@@ -7,11 +7,11 @@ Architecture:
   │  User Input │────▶│  Intent Detector │────▶│  Router Node  │
   └─────────────┘     └──────────────────┘     └───────┬───────┘
                                                          │
-                        ┌───────────────────────────────┼─────────────────────┐
-                        ▼                               ▼                     ▼
+                        ┌──────────────────────────────┼──────────────────────┐
+                        ▼                               ▼                      ▼
                ┌────────────────┐           ┌───────────────────┐   ┌──────────────────┐
                │  Greeter Node  │           │  RAG Answer Node  │   │  Lead Capture    │
-               └────────────────┘           └───────────────────┘   │  Node (3-step)   │
+               └────────────────┘           └───────────────────┘   │  Node (LLM-form) │
                                                                      └──────────────────┘
 
 Improvements:
@@ -19,16 +19,22 @@ Improvements:
   - Lead model uses EmailStr for declarative email validation (no manual regex).
   - Intent detection uses .with_structured_output(IntentResponse) so the LLM
     returns a typed Enum, eliminating string-parsing fragility.
+  - _trim_messages() keeps the last KEEP_LAST_N messages verbatim and condenses
+    older turns into a single SystemMessage summary, bounding context cost.
+  - Lead capture uses LLM-driven form filling (LeadFormSchema structured output)
+    — dynamically extracts name/email/platform from any user message and asks
+    only for what is still missing. No more manual FSM if/elif chains.
+  - All node functions are async; main.py streams tokens via astream_events().
 """
 
 import os
+import asyncio
 from enum import Enum
-from typing import Annotated, Literal, List
+from typing import Annotated, Literal, List, Optional
 from dotenv import load_dotenv
 
-from pydantic import BaseModel, EmailStr, field_validator, ConfigDict
+from pydantic import BaseModel, EmailStr, field_validator, ConfigDict, ValidationError
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage, BaseMessage
-from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langgraph.graph import StateGraph, END
 from langgraph.graph.message import add_messages
 
@@ -37,8 +43,8 @@ from tools.tools import retrieve_knowledge, mock_lead_capture
 load_dotenv()
 
 # ── LLM Setup ────────────────────────────────────────────────────────────────
-# Supports OpenAI (GPT-4o-mini), Google (Gemini 1.5 Flash), or Anthropic (Claude 3 Haiku)
-# Set LLM_PROVIDER in .env: "openai" | "google" | "anthropic"
+# Supports OpenAI (GPT-4o-mini), Google (Gemini 2.0 Flash), Groq, or Anthropic
+# Set LLM_PROVIDER in .env: "openai" | "google" | "groq" | "anthropic"
 
 def _build_llm():
     provider = os.getenv("LLM_PROVIDER", "anthropic").lower()
@@ -103,6 +109,19 @@ class _EmailCheck(BaseModel):
         return v.strip().lower() if isinstance(v, str) else v
 
 
+class LeadFormSchema(BaseModel):
+    """
+    Structured output for LLM-driven lead form extraction.
+
+    The LLM is asked to extract whichever fields the user has already
+    mentioned in their message. Fields not mentioned remain None so they
+    are NOT accidentally overwritten in the merged Lead object.
+    """
+    name: Optional[str] = None
+    email: Optional[str] = None
+    platform: Optional[str] = None
+
+
 # ── Intent Schema (Structured Output) ────────────────────────────────────────
 
 class Intent(str, Enum):
@@ -121,14 +140,11 @@ class AgentState(BaseModel):
     """Full runtime state of the AutoStream agent, validated by Pydantic."""
     model_config = ConfigDict(arbitrary_types_allowed=True)  # needed for LangChain BaseMessage
 
-    messages: Annotated[List[BaseMessage], add_messages] = []  # full conversation history
-    intent: Intent = Intent.greeting                            # current classified intent
-    lead_stage: Literal[
-        "none", "collecting_name", "collecting_email",
-        "collecting_platform", "done"
-    ] = "none"                                                  # lead capture FSM state
-    lead: Lead = Lead()                                         # validated lead data
-    rag_context: str = ""                                       # retrieved knowledge for current turn
+    messages:    Annotated[List[BaseMessage], add_messages] = []
+    intent:      Intent = Intent.greeting
+    lead_stage:  Literal["none", "collecting", "done"] = "none"
+    lead:        Lead = Lead()
+    rag_context: str = ""
 
 
 # ── Conversation Memory ───────────────────────────────────────────────────────
@@ -146,7 +162,7 @@ CONVERSATION:
 {history}"""
 
 
-def _trim_messages(messages: List[BaseMessage]) -> List[BaseMessage]:
+async def _trim_messages(messages: List[BaseMessage]) -> List[BaseMessage]:
     """
     Sliding-window context management.
 
@@ -171,7 +187,7 @@ def _trim_messages(messages: List[BaseMessage]) -> List[BaseMessage]:
         if isinstance(m, (HumanMessage, AIMessage))
     )
 
-    summary_response = llm.invoke([
+    summary_response = await llm.ainvoke([
         SystemMessage(content=_SUMMARY_PROMPT.format(history=history_text))
     ])
     summary_msg = SystemMessage(
@@ -187,19 +203,19 @@ Classify the user's latest message into exactly ONE of these intents:
 
 - greeting        — casual hello, how are you, general chit-chat
 - product_inquiry — questions about features, pricing, plans, policies, or how AutoStream works
-- high_intent     — user explicitly wants to sign up, start a trial, buy a plan, or try the product"""
+- high_intent     — user explicitly wants to sign up, start a trial, buy a plan, or try the product"""
 
 # The LLM is bound to return a valid IntentResponse — no string parsing needed.
 _intent_llm = llm.with_structured_output(IntentResponse)
 
-def detect_intent(state: AgentState) -> AgentState:
+async def detect_intent(state: AgentState) -> AgentState:
     """Classify user intent via structured LLM output (no regex / string parsing)."""
     last_human = next(
         (m.content for m in reversed(state.messages) if isinstance(m, HumanMessage)),
         ""
     )
 
-    result: IntentResponse = _intent_llm.invoke([
+    result: IntentResponse = await _intent_llm.ainvoke([
         SystemMessage(content=_INTENT_PROMPT),
         HumanMessage(content=last_human),
     ])
@@ -211,7 +227,7 @@ def detect_intent(state: AgentState) -> AgentState:
 
 def route(state: AgentState) -> Literal["greeter", "rag_answer", "lead_capture"]:
     """Decide which node handles this turn."""
-    if state.lead_stage not in ("none", "done"):
+    if state.lead_stage in ("collecting", "done"):
         return "lead_capture"
     if state.intent == Intent.high_intent:
         return "lead_capture"
@@ -222,15 +238,15 @@ def route(state: AgentState) -> Literal["greeter", "rag_answer", "lead_capture"]
 
 # ── Node: Greeter ─────────────────────────────────────────────────────────────
 
-_GREETER_SYSTEM = """You are Alex, a friendly and knowledgeable sales assistant for AutoStream — 
-an AI-powered video editing SaaS for content creators. 
+_GREETER_SYSTEM = """You are Alex, a friendly and knowledgeable sales assistant for AutoStream —
+an AI-powered video editing SaaS for content creators.
 
-Keep responses concise, warm, and helpful. If the user seems interested in the product, 
+Keep responses concise, warm, and helpful. If the user seems interested in the product,
 mention you'd be happy to share pricing details or help them get started."""
 
-def greeter_node(state: AgentState) -> AgentState:
-    context_msgs = _trim_messages(state.messages)
-    response = llm.invoke([
+async def greeter_node(state: AgentState) -> AgentState:
+    context_msgs = await _trim_messages(state.messages)
+    response = await llm.ainvoke([
         SystemMessage(content=_GREETER_SYSTEM),
         *context_msgs,
     ])
@@ -239,8 +255,8 @@ def greeter_node(state: AgentState) -> AgentState:
 
 # ── Node: RAG Answer ──────────────────────────────────────────────────────────
 
-_RAG_SYSTEM = """You are Alex, a knowledgeable sales assistant for AutoStream — 
-an AI-powered video editing SaaS. Answer the user's question using ONLY the knowledge 
+_RAG_SYSTEM = """You are Alex, a knowledgeable sales assistant for AutoStream —
+an AI-powered video editing SaaS. Answer the user's question using ONLY the knowledge
 base context provided below. Be concise, accurate, and helpful.
 
 If the user seems interested in signing up after your answer, invite them to do so.
@@ -249,17 +265,16 @@ KNOWLEDGE BASE CONTEXT:
 {context}
 """
 
-def rag_answer_node(state: AgentState) -> AgentState:
+async def rag_answer_node(state: AgentState) -> AgentState:
     last_human = next(
         (m.content for m in reversed(state.messages) if isinstance(m, HumanMessage)),
         ""
     )
     context = retrieve_knowledge(last_human)
-    context_msgs = _trim_messages(state.messages)
+    context_msgs = await _trim_messages(state.messages)
 
-    prompt = _RAG_SYSTEM.format(context=context)
-    response = llm.invoke([
-        SystemMessage(content=prompt),
+    response = await llm.ainvoke([
+        SystemMessage(content=_RAG_SYSTEM.format(context=context)),
         *context_msgs,
     ])
     return state.model_copy(update={
@@ -268,76 +283,139 @@ def rag_answer_node(state: AgentState) -> AgentState:
     })
 
 
-# ── Node: Lead Capture ────────────────────────────────────────────────────────
+# ── Node: Lead Capture (LLM-driven form extraction) ──────────────────────────
+#
+# Instead of a rigid FSM (collecting_name → collecting_email → …), the LLM
+# dynamically extracts whichever fields the user has provided in their message
+# and asks only for what is still missing. This handles natural multi-field
+# inputs ("I'm Ronit, ronit@example.com, I post on YouTube") in a single turn.
 
-def lead_capture_node(state: AgentState) -> AgentState:
-    stage = state.lead_stage
+_LEAD_EXTRACT_SYSTEM = """Extract sign-up information from the user's message.
+Return ONLY the fields explicitly mentioned. Leave any unmentioned field as null.
 
-    # ── Stage: none → start collection ──────────────────────────────────────
-    if stage == "none":
-        msg = (
-            "Great to hear you're interested in AutoStream Pro! 🎉\n\n"
-            "I'd love to get you set up. Could I start with your **full name**?"
-        )
-        return state.model_copy(update={
-            "lead_stage": "collecting_name",
-            "messages": [AIMessage(content=msg)],
-        })
+Fields to extract:
+- name: the user's full name
+- email: the user's email address
+- platform: the content platform they primarily create on (e.g. YouTube, TikTok, Instagram)"""
 
+_LEAD_ASK_SYSTEM = """You are Alex, a warm and friendly sales assistant for AutoStream — \
+an AI-powered video editing SaaS for content creators.
+
+You are helping a user sign up for AutoStream Pro.
+
+Already collected: {collected}
+Still needed: {missing}
+
+Ask the user for the missing information in a natural, conversational tone.
+Do NOT ask for or mention fields you already have.
+If multiple fields are missing, you can ask for them together in one friendly message."""
+
+# Bind the structured-output extractor once at module load.
+_extract_llm = llm.with_structured_output(LeadFormSchema)
+
+
+async def lead_capture_node(state: AgentState) -> AgentState:
+    """
+    LLM-driven lead form filling.
+
+    Each turn:
+      1. The LLM extracts any name/email/platform values from the user's message.
+      2. Extracted values are merged with existing lead data.
+      3. Email is validated via _EmailCheck (strict EmailStr).
+      4. If any field is still missing → LLM asks for it naturally.
+      5. When all three fields are present and valid → fire mock_lead_capture().
+    """
+    # ── Stage: done — post-signup follow-up ─────────────────────────────────
+    if state.lead_stage == "done":
+        context_msgs = await _trim_messages(state.messages)
+        response = await llm.ainvoke([
+            SystemMessage(
+                content="You are Alex from AutoStream. The user has already signed up as a lead. "
+                        "Be warm, answer any remaining questions, and let them know the team will be in touch."
+            ),
+            *context_msgs,
+        ])
+        return state.model_copy(update={"messages": [AIMessage(content=response.content)]})
+
+    # ── Extract fields from the latest user message ──────────────────────────
     last_human = next(
         (m.content for m in reversed(state.messages) if isinstance(m, HumanMessage)),
         ""
     ).strip()
 
-    # ── Stage: collecting_name ───────────────────────────────────────────────
-    if stage == "collecting_name":
-        updated_lead = state.lead.model_copy(update={"name": last_human})
-        return state.model_copy(update={
-            "lead": updated_lead,
-            "lead_stage": "collecting_email",
-            "messages": [AIMessage(content=f"Nice to meet you, **{last_human}**! 👋\n\nWhat's your **email address**?")],
-        })
+    extracted: LeadFormSchema = await _extract_llm.ainvoke([
+        SystemMessage(content=_LEAD_EXTRACT_SYSTEM),
+        HumanMessage(content=last_human),
+    ])
 
-    # ── Stage: collecting_email ──────────────────────────────────────────────
-    if stage == "collecting_email":
-        # Use the dedicated _EmailCheck model (strict EmailStr) for validation.
-        # Lead.email is a plain str field, so we validate here before storing.
-        from pydantic import ValidationError
+    # ── Merge extracted fields with existing lead (non-empty wins) ───────────
+    current = state.lead
+    name     = (extracted.name     or "").strip() or current.name
+    platform = (extracted.platform or "").strip() or current.platform
+
+    # Email needs validation before being stored
+    raw_email = (extracted.email or "").strip()
+    valid_email = current.email   # start with whatever was already accepted
+    email_invalid = False
+
+    if raw_email and raw_email.lower() != current.email:
         try:
-            _EmailCheck(email=last_human)   # raises ValidationError if malformed
+            _EmailCheck(email=raw_email)
+            valid_email = raw_email.lower()
         except ValidationError:
-            return state.model_copy(update={
-                "messages": [AIMessage(content="Hmm, that doesn't look like a valid email. Could you double-check and re-enter it?")],
-            })
-        updated_lead = state.lead.model_copy(update={"email": last_human})
-        return state.model_copy(update={
-            "lead": updated_lead,
-            "lead_stage": "collecting_platform",
-            "messages": [AIMessage(content="Got it! Last question — which platform do you primarily create content on?\n(e.g., YouTube, Instagram, TikTok, LinkedIn…)")],
-        })
+            email_invalid = True   # tell the user below
 
-    # ── Stage: collecting_platform → fire tool ───────────────────────────────
-    if stage == "collecting_platform":
-        updated_lead = state.lead.model_copy(update={"platform": last_human})
+    updated_lead = Lead(name=name, email=valid_email, platform=platform)
+
+    # ── Determine which fields are still missing ─────────────────────────────
+    missing: list[str] = []
+    if not updated_lead.name:
+        missing.append("your full name")
+    if email_invalid:
+        missing.append(f"a valid email address — '{raw_email}' didn't look right")
+    elif not updated_lead.email:
+        missing.append("your email address")
+    if not updated_lead.platform:
+        missing.append("the platform you primarily create content on (e.g. YouTube, TikTok, Instagram)")
+
+    # ── All fields collected → fire the tool ────────────────────────────────
+    if not missing:
         result = mock_lead_capture(
             name=updated_lead.name,
-            email=str(updated_lead.email),
+            email=updated_lead.email,
             platform=updated_lead.platform,
         )
         return state.model_copy(update={
-            "lead": updated_lead,
+            "lead":       updated_lead,
             "lead_stage": "done",
-            "messages": [AIMessage(content=result)],
+            "messages":   [AIMessage(content=result)],
         })
 
-    # ── Stage: done — follow-up conversation ─────────────────────────────────
-    context_msgs = _trim_messages(state.messages)
-    response = llm.invoke([
-        SystemMessage(content="You are Alex from AutoStream. The user has already signed up as a lead. "
-                               "Be warm, answer any remaining questions, and let them know the team will be in touch."),
-        *context_msgs,
+    # ── Ask for missing fields naturally ─────────────────────────────────────
+    collected_parts: list[str] = []
+    if updated_lead.name:
+        collected_parts.append(f"name: {updated_lead.name}")
+    if updated_lead.email:
+        collected_parts.append(f"email: {updated_lead.email}")
+    if updated_lead.platform:
+        collected_parts.append(f"platform: {updated_lead.platform}")
+
+    collected_str = ", ".join(collected_parts) if collected_parts else "nothing yet"
+    missing_str   = " and ".join(missing)
+
+    response = await llm.ainvoke([
+        SystemMessage(content=_LEAD_ASK_SYSTEM.format(
+            collected=collected_str,
+            missing=missing_str,
+        )),
+        *state.messages[-4:],   # small recent window — keep prompt tight
     ])
-    return state.model_copy(update={"messages": [AIMessage(content=response.content)]})
+
+    return state.model_copy(update={
+        "lead":       updated_lead,
+        "lead_stage": "collecting",
+        "messages":   [AIMessage(content=response.content)],
+    })
 
 
 # ── Build LangGraph ───────────────────────────────────────────────────────────
@@ -346,9 +424,9 @@ def build_graph() -> StateGraph:
     graph = StateGraph(AgentState)
 
     graph.add_node("intent_detector", detect_intent)
-    graph.add_node("greeter", greeter_node)
-    graph.add_node("rag_answer", rag_answer_node)
-    graph.add_node("lead_capture", lead_capture_node)
+    graph.add_node("greeter",         greeter_node)
+    graph.add_node("rag_answer",      rag_answer_node)
+    graph.add_node("lead_capture",    lead_capture_node)
 
     graph.set_entry_point("intent_detector")
 
@@ -356,14 +434,14 @@ def build_graph() -> StateGraph:
         "intent_detector",
         route,
         {
-            "greeter": "greeter",
-            "rag_answer": "rag_answer",
-            "lead_capture": "lead_capture",
+            "greeter":       "greeter",
+            "rag_answer":    "rag_answer",
+            "lead_capture":  "lead_capture",
         },
     )
 
-    graph.add_edge("greeter", END)
-    graph.add_edge("rag_answer", END)
-    graph.add_edge("lead_capture", END)
+    graph.add_edge("greeter",       END)
+    graph.add_edge("rag_answer",    END)
+    graph.add_edge("lead_capture",  END)
 
     return graph.compile()

@@ -5,12 +5,14 @@ Run with:
     pytest tests/ -v
 
 Tests cover:
-  - Email validation via Pydantic Lead model
+  - Email validation via Pydantic _EmailCheck model
   - Intent classification schema (Intent Enum)
-  - Knowledge retrieval (RAG keyword matching)
+  - Semantic RAG knowledge retrieval (ChromaDB)
   - Lead CSV persistence
   - State model_copy safety
   - AI message detection
+  - Sliding-window conversation memory (_trim_messages, now async)
+  - LLM-driven lead form extraction (LeadFormSchema)
 """
 
 import sys
@@ -249,9 +251,12 @@ class TestAIMessageDetection:
         assert last_ai == "(no response)"
 
 
-# ── Conversation Memory Tests ─────────────────────────────────────────────────
+# ── Conversation Memory Tests ───────────────────────────────────────────────────────────────
+# _trim_messages is now async (uses llm.ainvoke internally).
+# We use asyncio.run() to exercise it in sync test methods.
 
-from unittest.mock import MagicMock, patch
+import asyncio
+from unittest.mock import MagicMock, AsyncMock, patch
 from agent.agent import _trim_messages, KEEP_LAST_N
 
 
@@ -266,18 +271,17 @@ class TestTrimMessages:
 
     def test_short_history_returned_unchanged(self):
         """When len(messages) <= KEEP_LAST_N, no summarisation should happen."""
-        msgs = self._make_convo(KEEP_LAST_N // 2)   # well under the threshold
-        result = _trim_messages(msgs)
+        msgs = self._make_convo(KEEP_LAST_N // 2)
+        result = asyncio.run(_trim_messages(msgs))
         assert result == msgs
 
     def test_exact_threshold_returned_unchanged(self):
         """Exactly KEEP_LAST_N messages should not trigger summarisation."""
         msgs = self._make_convo(KEEP_LAST_N // 2)
-        # pad to exactly KEEP_LAST_N
         while len(msgs) < KEEP_LAST_N:
             msgs.append(HumanMessage(content="extra"))
         assert len(msgs) == KEEP_LAST_N
-        result = _trim_messages(msgs)
+        result = asyncio.run(_trim_messages(msgs))
         assert result == msgs
 
     def test_long_history_triggers_summary(self):
@@ -285,32 +289,105 @@ class TestTrimMessages:
         a list starting with a SystemMessage summary + last KEEP_LAST_N msgs."""
         msgs = self._make_convo(KEEP_LAST_N)    # 2 * KEEP_LAST_N total > threshold
 
-        mock_llm_response = MagicMock()
-        mock_llm_response.content = "User asked about pricing and features."
+        mock_response = MagicMock()
+        mock_response.content = "User asked about pricing and features."
 
         with patch("agent.agent.llm") as mock_llm:
-            mock_llm.invoke.return_value = mock_llm_response
-            result = _trim_messages(msgs)
+            mock_llm.ainvoke = AsyncMock(return_value=mock_response)
+            result = asyncio.run(_trim_messages(msgs))
 
-        # First element should be the SystemMessage summary
         assert isinstance(result[0], SystemMessage)
         assert "Conversation Summary" in result[0].content
-
-        # Should have exactly 1 summary + KEEP_LAST_N recent messages
         assert len(result) == KEEP_LAST_N + 1
-
-        # The last KEEP_LAST_N messages should be the most recent ones
         assert result[1:] == msgs[-KEEP_LAST_N:]
 
     def test_summary_content_included_in_system_message(self):
         """The LLM's summary text should appear inside the SystemMessage."""
         msgs = self._make_convo(KEEP_LAST_N + 2)
 
-        mock_llm_response = MagicMock()
-        mock_llm_response.content = "Summary: user discussed refund policy."
+        mock_response = MagicMock()
+        mock_response.content = "Summary: user discussed refund policy."
 
         with patch("agent.agent.llm") as mock_llm:
-            mock_llm.invoke.return_value = mock_llm_response
-            result = _trim_messages(msgs)
+            mock_llm.ainvoke = AsyncMock(return_value=mock_response)
+            result = asyncio.run(_trim_messages(msgs))
 
         assert "Summary: user discussed refund policy." in result[0].content
+
+
+# ── Lead Form Schema Tests ────────────────────────────────────────────────────
+
+import pytest
+from agent.agent import LeadFormSchema
+
+
+class TestLeadFormSchema:
+    def test_all_fields_present(self):
+        schema = LeadFormSchema(name="Ronit", email="ronit@example.com", platform="YouTube")
+        assert schema.name == "Ronit"
+        assert schema.email == "ronit@example.com"
+        assert schema.platform == "YouTube"
+
+    def test_partial_fields_allowed(self):
+        """LeadFormSchema fields are all Optional — partial fills are valid."""
+        schema = LeadFormSchema(name="Ronit")
+        assert schema.name == "Ronit"
+        assert schema.email is None
+        assert schema.platform is None
+
+    def test_empty_schema_all_none(self):
+        schema = LeadFormSchema()
+        assert schema.name is None
+        assert schema.email is None
+        assert schema.platform is None
+
+    def test_lead_merge_logic(self):
+        """Verify the merge pattern used in lead_capture_node:
+        extracted non-None fields override current; None fields fall back to current."""
+        current  = Lead(name="Ronit", email="", platform="")
+        extracted = LeadFormSchema(name=None, email="ronit@example.com", platform="YouTube")
+
+        name     = (extracted.name     or "").strip() or current.name
+        platform = (extracted.platform or "").strip() or current.platform
+        email    = (extracted.email    or "").strip() or current.email
+
+        assert name     == "Ronit"               # kept from current
+        assert email    == "ronit@example.com"   # merged from extracted
+        assert platform == "YouTube"             # merged from extracted
+
+    def test_invalid_email_detected_by_email_check(self):
+        """When extraction yields a bad email, _EmailCheck raises ValidationError."""
+        with pytest.raises(ValidationError):
+            _EmailCheck(email="not-an-email")
+
+
+# ── Simplified Lead Stage Tests ───────────────────────────────────────────────
+
+class TestLeadStageSimplified:
+    def test_default_stage_is_none(self):
+        state = AgentState()
+        assert state.lead_stage == "none"
+
+    def test_collecting_stage_is_valid(self):
+        state = AgentState(lead_stage="collecting")
+        assert state.lead_stage == "collecting"
+
+    def test_done_stage_is_valid(self):
+        state = AgentState(lead_stage="done")
+        assert state.lead_stage == "done"
+
+    def test_old_fsm_stage_rejected(self):
+        """The old FSM stages (collecting_name, etc.) are no longer valid."""
+        with pytest.raises((ValidationError, ValueError)):
+            AgentState(lead_stage="collecting_name")
+
+    def test_transition_none_to_collecting(self):
+        state = AgentState(lead_stage="none")
+        updated = state.model_copy(update={"lead_stage": "collecting"})
+        assert updated.lead_stage == "collecting"
+        assert state.lead_stage == "none"   # original unchanged
+
+    def test_transition_collecting_to_done(self):
+        state = AgentState(lead_stage="collecting")
+        updated = state.model_copy(update={"lead_stage": "done"})
+        assert updated.lead_stage == "done"
