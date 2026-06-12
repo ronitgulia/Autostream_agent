@@ -11,3 +11,6 @@ build/
 
 # Lead data — contains PII, never commit
 leads.csv
+
+# ChromaDB local vector store — rebuilt automatically on first run
+.chroma_db/

@@ -1,20 +1,31 @@
 """
 tools.py — AutoStream Agent Tool Definitions
 Provides:
-  - mock_lead_capture(): simulates CRM lead capture
-  - retrieve_knowledge(): RAG retrieval from local JSON knowledge base
+  - retrieve_knowledge(): semantic RAG retrieval via ChromaDB + sentence-transformers
+  - mock_lead_capture(): simulates CRM lead capture, persists to leads.csv
+
+RAG Architecture:
+  Knowledge base JSON  ──▶  chunked documents  ──▶  embeddings (all-MiniLM-L6-v2)
+        ──▶  ChromaDB persistent collection (.chroma_db/)
+        ──▶  cosine similarity search on query
 """
 
 import json
-import os
 import csv
 from datetime import datetime, timezone
 from pathlib import Path
 
+import chromadb
+from chromadb.utils import embedding_functions
 
-# ── Load knowledge base once at import time ──────────────────────────────────
 
-_KB_PATH = Path(__file__).parent.parent / "knowledge_base" / "autostream_kb.json"
+# ── Paths ─────────────────────────────────────────────────────────────────────
+
+_KB_PATH     = Path(__file__).parent.parent / "knowledge_base" / "autostream_kb.json"
+_CHROMA_PATH = Path(__file__).parent.parent / ".chroma_db"
+
+
+# ── Load raw knowledge base ───────────────────────────────────────────────────
 
 def _load_kb() -> dict:
     with open(_KB_PATH, "r") as f:
@@ -23,59 +34,116 @@ def _load_kb() -> dict:
 _KB = _load_kb()
 
 
-# ── Tool 1: RAG Knowledge Retrieval ─────────────────────────────────────────
+# ── Chunk the KB into embeddable documents ────────────────────────────────────
 
-def retrieve_knowledge(query: str) -> str:
+def _build_chunks(kb: dict) -> tuple[list[str], list[str]]:
     """
-    Simulate RAG retrieval by searching the local knowledge base.
-    Returns a formatted string of relevant context for the LLM.
+    Convert the KB JSON into flat text chunks and stable IDs.
+    One chunk per logical unit: company overview, each plan, each policy, each FAQ.
     """
-    query_lower = query.lower()
-    results = []
+    docs: list[str] = []
+    ids:  list[str] = []
 
-    # Match pricing / plan queries
-    if any(kw in query_lower for kw in ["price", "pricing", "plan", "cost", "how much", "basic", "pro", "subscription"]):
-        results.append("=== AutoStream Pricing Plans ===")
-        for plan in _KB["plans"]:
-            features_str = "\n    • ".join(plan["features"])
-            results.append(
-                f"\n📦 {plan['name']} — ${plan['price_monthly']}/month\n"
-                f"  Best for: {plan['best_for']}\n"
-                f"  Features:\n    • {features_str}"
-            )
+    # Company overview
+    co = kb["company"]
+    docs.append(
+        f"About AutoStream: {co['description']} Tagline: {co['tagline']}"
+    )
+    ids.append("company_overview")
 
-    # Match policy queries
-    if any(kw in query_lower for kw in ["refund", "cancel", "support", "policy", "trial", "free"]):
-        results.append("\n=== Company Policies ===")
-        for policy in _KB["policies"]:
-            results.append(f"\n📋 {policy['topic']}: {policy['details']}")
-
-    # Match FAQ queries
-    if any(kw in query_lower for kw in ["platform", "youtube", "instagram", "tiktok", "upgrade", "downgrade",
-                                          "video length", "limit", "team", "export", "resolution"]):
-        results.append("\n=== FAQs ===")
-        for faq in _KB["faqs"]:
-            if any(kw in faq["question"].lower() or kw in faq["answer"].lower()
-                   for kw in query_lower.split()):
-                results.append(f"\nQ: {faq['question']}\nA: {faq['answer']}")
-
-    # General company info fallback
-    if not results:
-        co = _KB["company"]
-        results.append(
-            f"=== About AutoStream ===\n{co['description']}\nTagline: {co['tagline']}"
+    # Pricing plans (one chunk per plan — keeps context focused)
+    for plan in kb["plans"]:
+        features = ", ".join(plan["features"])
+        docs.append(
+            f"{plan['name']} costs ${plan['price_monthly']}/month. "
+            f"Best for: {plan['best_for']}. "
+            f"Features include: {features}."
         )
-        results.append("\n=== Available Plans ===")
-        for plan in _KB["plans"]:
-            results.append(f"  • {plan['name']}: ${plan['price_monthly']}/month")
+        ids.append(f"plan_{plan['name'].lower().replace(' ', '_')}")
 
-    return "\n".join(results)
+    # Policies
+    for policy in kb["policies"]:
+        docs.append(f"{policy['topic']}: {policy['details']}")
+        ids.append(f"policy_{policy['topic'].lower().replace(' ', '_')}")
+
+    # FAQs
+    for i, faq in enumerate(kb["faqs"]):
+        docs.append(f"Question: {faq['question']} Answer: {faq['answer']}")
+        ids.append(f"faq_{i}")
+
+    return docs, ids
+
+
+# ── Build / load ChromaDB vector store ───────────────────────────────────────
+
+def _build_vectorstore():
+    """
+    Create a persistent ChromaDB collection with sentence-transformer embeddings.
+    On first run: chunks KB + embeds (takes ~5 s to download model).
+    On subsequent runs: loads the existing .chroma_db/ collection instantly.
+    """
+    ef = embedding_functions.SentenceTransformerEmbeddingFunction(
+        model_name="all-MiniLM-L6-v2"
+    )
+    client = chromadb.PersistentClient(path=str(_CHROMA_PATH))
+    collection = client.get_or_create_collection(
+        name="autostream_kb",
+        embedding_function=ef,
+        metadata={"hnsw:space": "cosine"},
+    )
+
+    if collection.count() == 0:
+        # First-time setup: embed all chunks
+        docs, ids = _build_chunks(_KB)
+        collection.add(documents=docs, ids=ids)
+        print(f"[RAG] Vector store built: {len(docs)} chunks embedded → .chroma_db/")
+    else:
+        print(f"[RAG] Vector store loaded: {collection.count()} chunks from .chroma_db/")
+
+    return collection
+
+
+_COLLECTION = _build_vectorstore()
+
+
+# ── Tool 1: Semantic RAG Retrieval ───────────────────────────────────────────
+
+def retrieve_knowledge(query: str, top_k: int = 3) -> str:
+    """
+    Semantic knowledge retrieval using ChromaDB cosine similarity search.
+
+    Replaces the old keyword-matching approach — now works for paraphrased,
+    indirect, or semantically equivalent queries (e.g. "Is it affordable?"
+    correctly retrieves pricing chunks).
+
+    Args:
+        query:  The user's natural-language question.
+        top_k:  Number of most relevant chunks to return (default: 3).
+
+    Returns:
+        A formatted string of the top-k context chunks for the LLM.
+    """
+    n = min(top_k, _COLLECTION.count())
+    if n == 0:
+        return "No knowledge base context available."
+
+    results = _COLLECTION.query(query_texts=[query], n_results=n)
+    matched_docs: list[str] = results["documents"][0]
+
+    if not matched_docs:
+        co = _KB["company"]
+        return f"About AutoStream: {co['description']}\nTagline: {co['tagline']}"
+
+    return "\n\n".join(
+        f"[Context {i + 1}]\n{doc}" for i, doc in enumerate(matched_docs)
+    )
 
 
 # ── Tool 2: Lead Capture (persists to leads.csv) ────────────────────────────
 
-_LEADS_CSV = Path(__file__).parent.parent / "leads.csv"
+_LEADS_CSV   = Path(__file__).parent.parent / "leads.csv"
 _CSV_HEADERS = ["timestamp", "name", "email", "platform"]
+
 
 def _append_lead_to_csv(name: str, email: str, platform: str) -> None:
     """Write one lead row to leads.csv, creating the file with headers if needed."""
@@ -83,7 +151,7 @@ def _append_lead_to_csv(name: str, email: str, platform: str) -> None:
     with open(_LEADS_CSV, "a", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
         if not file_exists:
-            writer.writerow(_CSV_HEADERS)   # write header only on first run
+            writer.writerow(_CSV_HEADERS)
         writer.writerow([
             datetime.now(timezone.utc).isoformat(),
             name,
@@ -97,10 +165,8 @@ def mock_lead_capture(name: str, email: str, platform: str) -> str:
     Capture lead data and persist it to leads.csv.
     In production this would also POST to a real CRM API.
     """
-    # ── Persist to CSV ───────────────────────────────────────────────────────
     _append_lead_to_csv(name, email, platform)
 
-    # ── Console confirmation ─────────────────────────────────────────────────
     print(f"\n{'='*55}")
     print(f"  ✅  LEAD CAPTURED & SAVED TO leads.csv")
     print(f"{'='*55}")

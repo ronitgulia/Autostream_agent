@@ -97,32 +97,46 @@ class TestIntentEnum:
         assert state.intent == Intent.greeting
 
 
-# ── RAG Knowledge Retrieval Tests ─────────────────────────────────────────────
+# ── RAG Knowledge Retrieval Tests (Semantic) ──────────────────────────────────────
+# The new ChromaDB retriever uses cosine similarity, so these tests cover
+# both direct keyword queries AND paraphrased / semantic queries that the
+# old keyword-matching approach would have silently missed.
 
 class TestRetrieveKnowledge:
-    def test_pricing_keywords_return_plans(self):
-        from tools.tools import retrieve_knowledge
-        result = retrieve_knowledge("how much does it cost")
-        assert "Pricing" in result or "plan" in result.lower()
-
-    def test_pricing_direct_keyword(self):
+    def test_direct_pricing_query(self):
+        """Exact keyword match should return pricing context."""
         from tools.tools import retrieve_knowledge
         result = retrieve_knowledge("what are the pricing plans")
-        assert "$" in result  # plans have prices
+        assert "$" in result or "month" in result.lower()
+
+    def test_semantic_affordability_query(self):
+        """'Is it affordable?' has no pricing keywords but should still match price chunks."""
+        from tools.tools import retrieve_knowledge
+        result = retrieve_knowledge("Is it affordable?")
+        # Semantic search should surface plan or pricing context
+        assert any(kw in result.lower() for kw in ["plan", "$", "month", "cost", "price"])
+
+    def test_semantic_video_limits_query(self):
+        """'Tell me about video limits' — indirect phrasing should match FAQ chunk."""
+        from tools.tools import retrieve_knowledge
+        result = retrieve_knowledge("Tell me about video limits")
+        assert any(kw in result.lower() for kw in ["video", "minute", "hour", "limit", "basic", "pro"])
 
     def test_refund_policy_returned(self):
         from tools.tools import retrieve_knowledge
         result = retrieve_knowledge("what is your refund policy")
-        assert "refund" in result.lower() or "Policies" in result
+        assert "refund" in result.lower()
 
-    def test_unknown_query_returns_fallback(self):
-        from tools.tools import retrieve_knowledge
-        result = retrieve_knowledge("xyzzy foobar nonsense")
-        assert "AutoStream" in result  # fallback always mentions company
-
-    def test_result_is_string(self):
+    def test_result_is_non_empty_string(self):
         from tools.tools import retrieve_knowledge
         result = retrieve_knowledge("pricing")
+        assert isinstance(result, str)
+        assert len(result) > 0
+
+    def test_fallback_for_nonsense_query(self):
+        """Even a nonsense query returns the closest chunk (never empty)."""
+        from tools.tools import retrieve_knowledge
+        result = retrieve_knowledge("xyzzy foobar baz")
         assert isinstance(result, str)
         assert len(result) > 0
 
@@ -233,3 +247,70 @@ class TestAIMessageDetection:
             "(no response)"
         )
         assert last_ai == "(no response)"
+
+
+# ── Conversation Memory Tests ─────────────────────────────────────────────────
+
+from unittest.mock import MagicMock, patch
+from agent.agent import _trim_messages, KEEP_LAST_N
+
+
+class TestTrimMessages:
+    def _make_convo(self, n_pairs: int) -> list:
+        """Build n_pairs of (HumanMessage, AIMessage) for a total of 2*n_pairs msgs."""
+        msgs = []
+        for i in range(n_pairs):
+            msgs.append(HumanMessage(content=f"User turn {i}"))
+            msgs.append(AIMessage(content=f"Agent turn {i}"))
+        return msgs
+
+    def test_short_history_returned_unchanged(self):
+        """When len(messages) <= KEEP_LAST_N, no summarisation should happen."""
+        msgs = self._make_convo(KEEP_LAST_N // 2)   # well under the threshold
+        result = _trim_messages(msgs)
+        assert result == msgs
+
+    def test_exact_threshold_returned_unchanged(self):
+        """Exactly KEEP_LAST_N messages should not trigger summarisation."""
+        msgs = self._make_convo(KEEP_LAST_N // 2)
+        # pad to exactly KEEP_LAST_N
+        while len(msgs) < KEEP_LAST_N:
+            msgs.append(HumanMessage(content="extra"))
+        assert len(msgs) == KEEP_LAST_N
+        result = _trim_messages(msgs)
+        assert result == msgs
+
+    def test_long_history_triggers_summary(self):
+        """When history exceeds KEEP_LAST_N, _trim_messages should return
+        a list starting with a SystemMessage summary + last KEEP_LAST_N msgs."""
+        msgs = self._make_convo(KEEP_LAST_N)    # 2 * KEEP_LAST_N total > threshold
+
+        mock_llm_response = MagicMock()
+        mock_llm_response.content = "User asked about pricing and features."
+
+        with patch("agent.agent.llm") as mock_llm:
+            mock_llm.invoke.return_value = mock_llm_response
+            result = _trim_messages(msgs)
+
+        # First element should be the SystemMessage summary
+        assert isinstance(result[0], SystemMessage)
+        assert "Conversation Summary" in result[0].content
+
+        # Should have exactly 1 summary + KEEP_LAST_N recent messages
+        assert len(result) == KEEP_LAST_N + 1
+
+        # The last KEEP_LAST_N messages should be the most recent ones
+        assert result[1:] == msgs[-KEEP_LAST_N:]
+
+    def test_summary_content_included_in_system_message(self):
+        """The LLM's summary text should appear inside the SystemMessage."""
+        msgs = self._make_convo(KEEP_LAST_N + 2)
+
+        mock_llm_response = MagicMock()
+        mock_llm_response.content = "Summary: user discussed refund policy."
+
+        with patch("agent.agent.llm") as mock_llm:
+            mock_llm.invoke.return_value = mock_llm_response
+            result = _trim_messages(msgs)
+
+        assert "Summary: user discussed refund policy." in result[0].content

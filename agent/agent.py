@@ -131,6 +131,55 @@ class AgentState(BaseModel):
     rag_context: str = ""                                       # retrieved knowledge for current turn
 
 
+# ── Conversation Memory ───────────────────────────────────────────────────────
+
+# Number of most-recent messages always kept verbatim in the context window.
+# Older messages are condensed into a single SystemMessage summary.
+KEEP_LAST_N = 10
+
+_SUMMARY_PROMPT = """Summarise the following conversation between a user and AutoStream's
+sales assistant Alex. Be concise. Capture: the user's name (if shared), their main
+questions or concerns, and any decisions or information already exchanged.
+Do NOT include the most recent exchange — only prior context.
+
+CONVERSATION:
+{history}"""
+
+
+def _trim_messages(messages: List[BaseMessage]) -> List[BaseMessage]:
+    """
+    Sliding-window context management.
+
+    If len(messages) <= KEEP_LAST_N: returns the list unchanged.
+    Otherwise:
+      1. Formats the older messages as a plain-text history string.
+      2. Asks the LLM to summarise them into a single SystemMessage.
+      3. Returns [summary_msg] + last KEEP_LAST_N messages.
+
+    This keeps every LLM call within a predictable token budget regardless
+    of how long the conversation runs.
+    """
+    if len(messages) <= KEEP_LAST_N:
+        return messages
+
+    older  = messages[:-KEEP_LAST_N]
+    recent = messages[-KEEP_LAST_N:]
+
+    history_text = "\n".join(
+        f"{'User' if isinstance(m, HumanMessage) else 'Agent'}: {m.content}"
+        for m in older
+        if isinstance(m, (HumanMessage, AIMessage))
+    )
+
+    summary_response = llm.invoke([
+        SystemMessage(content=_SUMMARY_PROMPT.format(history=history_text))
+    ])
+    summary_msg = SystemMessage(
+        content=f"[Conversation Summary — earlier turns]\n{summary_response.content}"
+    )
+    return [summary_msg] + list(recent)
+
+
 # ── Intent Detection (Structured Output) ─────────────────────────────────────
 
 _INTENT_PROMPT = """You are an intent classifier for AutoStream, a video editing SaaS.
@@ -180,9 +229,10 @@ Keep responses concise, warm, and helpful. If the user seems interested in the p
 mention you'd be happy to share pricing details or help them get started."""
 
 def greeter_node(state: AgentState) -> AgentState:
+    context_msgs = _trim_messages(state.messages)
     response = llm.invoke([
         SystemMessage(content=_GREETER_SYSTEM),
-        *state.messages,
+        *context_msgs,
     ])
     return state.model_copy(update={"messages": [AIMessage(content=response.content)]})
 
@@ -205,11 +255,12 @@ def rag_answer_node(state: AgentState) -> AgentState:
         ""
     )
     context = retrieve_knowledge(last_human)
+    context_msgs = _trim_messages(state.messages)
 
     prompt = _RAG_SYSTEM.format(context=context)
     response = llm.invoke([
         SystemMessage(content=prompt),
-        *state.messages,
+        *context_msgs,
     ])
     return state.model_copy(update={
         "rag_context": context,
@@ -280,10 +331,11 @@ def lead_capture_node(state: AgentState) -> AgentState:
         })
 
     # ── Stage: done — follow-up conversation ─────────────────────────────────
+    context_msgs = _trim_messages(state.messages)
     response = llm.invoke([
         SystemMessage(content="You are Alex from AutoStream. The user has already signed up as a lead. "
                                "Be warm, answer any remaining questions, and let them know the team will be in touch."),
-        *state.messages,
+        *context_msgs,
     ])
     return state.model_copy(update={"messages": [AIMessage(content=response.content)]})
 
