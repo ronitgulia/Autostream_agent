@@ -1,15 +1,3 @@
-"""
-tools.py — AutoStream Agent Tool Definitions
-Provides:
-  - retrieve_knowledge(): semantic RAG retrieval via ChromaDB + sentence-transformers
-  - mock_lead_capture(): simulates CRM lead capture, persists to leads.csv
-
-RAG Architecture:
-  Knowledge base JSON  ──▶  chunked documents  ──▶  embeddings (all-MiniLM-L6-v2)
-        ──▶  ChromaDB persistent collection (.chroma_db/)
-        ──▶  cosine similarity search on query
-"""
-
 import json
 import csv
 from datetime import datetime, timezone
@@ -19,39 +7,30 @@ import chromadb
 from chromadb.utils import embedding_functions
 
 
-# ── Paths ─────────────────────────────────────────────────────────────────────
-
-_KB_PATH     = Path(__file__).parent.parent / "knowledge_base" / "autostream_kb.json"
+_KB_PATH = Path(__file__).parent.parent / "knowledge_base" / "autostream_kb.json"
 _CHROMA_PATH = Path(__file__).parent.parent / ".chroma_db"
 
-
-# ── Load raw knowledge base ───────────────────────────────────────────────────
 
 def _load_kb() -> dict:
     with open(_KB_PATH, "r") as f:
         return json.load(f)
 
+
 _KB = _load_kb()
 
 
-# ── Chunk the KB into embeddable documents ────────────────────────────────────
-
 def _build_chunks(kb: dict) -> tuple[list[str], list[str]]:
-    """
-    Convert the KB JSON into flat text chunks and stable IDs.
+    """Convert the KB JSON into flat text chunks and stable IDs.
+
     One chunk per logical unit: company overview, each plan, each policy, each FAQ.
     """
     docs: list[str] = []
-    ids:  list[str] = []
+    ids: list[str] = []
 
-    # Company overview
     co = kb["company"]
-    docs.append(
-        f"About AutoStream: {co['description']} Tagline: {co['tagline']}"
-    )
+    docs.append(f"About AutoStream: {co['description']} Tagline: {co['tagline']}")
     ids.append("company_overview")
 
-    # Pricing plans (one chunk per plan — keeps context focused)
     for plan in kb["plans"]:
         features = ", ".join(plan["features"])
         docs.append(
@@ -61,12 +40,10 @@ def _build_chunks(kb: dict) -> tuple[list[str], list[str]]:
         )
         ids.append(f"plan_{plan['name'].lower().replace(' ', '_')}")
 
-    # Policies
     for policy in kb["policies"]:
         docs.append(f"{policy['topic']}: {policy['details']}")
         ids.append(f"policy_{policy['topic'].lower().replace(' ', '_')}")
 
-    # FAQs
     for i, faq in enumerate(kb["faqs"]):
         docs.append(f"Question: {faq['question']} Answer: {faq['answer']}")
         ids.append(f"faq_{i}")
@@ -74,13 +51,11 @@ def _build_chunks(kb: dict) -> tuple[list[str], list[str]]:
     return docs, ids
 
 
-# ── Build / load ChromaDB vector store ───────────────────────────────────────
-
 def _build_vectorstore():
-    """
-    Create a persistent ChromaDB collection with sentence-transformer embeddings.
-    On first run: chunks KB + embeds (takes ~5 s to download model).
-    On subsequent runs: loads the existing .chroma_db/ collection instantly.
+    """Create or load the persistent ChromaDB collection.
+
+    On first run, chunks and embeds the knowledge base (~5 s to download model).
+    On subsequent runs, loads the existing collection from .chroma_db/ instantly.
     """
     ef = embedding_functions.SentenceTransformerEmbeddingFunction(
         model_name="all-MiniLM-L6-v2"
@@ -93,7 +68,6 @@ def _build_vectorstore():
     )
 
     if collection.count() == 0:
-        # First-time setup: embed all chunks
         docs, ids = _build_chunks(_KB)
         collection.add(documents=docs, ids=ids)
         print(f"[RAG] Vector store built: {len(docs)} chunks embedded → .chroma_db/")
@@ -106,15 +80,8 @@ def _build_vectorstore():
 _COLLECTION = _build_vectorstore()
 
 
-# ── Tool 1: Semantic RAG Retrieval ───────────────────────────────────────────
-
 def retrieve_knowledge(query: str, top_k: int = 3) -> str:
-    """
-    Semantic knowledge retrieval using ChromaDB cosine similarity search.
-
-    Replaces the old keyword-matching approach — now works for paraphrased,
-    indirect, or semantically equivalent queries (e.g. "Is it affordable?"
-    correctly retrieves pricing chunks).
+    """Semantic knowledge retrieval using ChromaDB cosine similarity search.
 
     Args:
         query:  The user's natural-language question.
@@ -139,14 +106,12 @@ def retrieve_knowledge(query: str, top_k: int = 3) -> str:
     )
 
 
-# ── Tool 2: Lead Capture (persists to leads.csv) ────────────────────────────
-
-_LEADS_CSV   = Path(__file__).parent.parent / "leads.csv"
+_LEADS_CSV = Path(__file__).parent.parent / "leads.csv"
 _CSV_HEADERS = ["timestamp", "name", "email", "platform"]
 
 
 def _append_lead_to_csv(name: str, email: str, platform: str) -> None:
-    """Write one lead row to leads.csv, creating the file with headers if needed."""
+    """Append one lead row to leads.csv, creating the file with headers if needed."""
     file_exists = _LEADS_CSV.exists()
     with open(_LEADS_CSV, "a", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
@@ -161,8 +126,8 @@ def _append_lead_to_csv(name: str, email: str, platform: str) -> None:
 
 
 def mock_lead_capture(name: str, email: str, platform: str) -> str:
-    """
-    Capture lead data and persist it to leads.csv.
+    """Capture lead data and persist it to leads.csv.
+
     In production this would also POST to a real CRM API.
     """
     _append_lead_to_csv(name, email, platform)
