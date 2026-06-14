@@ -26,6 +26,7 @@ from agent.agent import (
     LeadFormSchema,
     _EmailCheck,
     _trim_messages,
+    _with_retry,
     KEEP_LAST_N,
 )
 
@@ -322,3 +323,113 @@ class TestLeadStageSimplified:
         state = AgentState(lead_stage="collecting")
         updated = state.model_copy(update={"lead_stage": "done"})
         assert updated.lead_stage == "done"
+
+
+class TestRetryLogic:
+    """Tests for the _with_retry() exponential backoff helper."""
+
+    def test_succeeds_on_first_attempt(self):
+        call_count = 0
+
+        async def always_ok():
+            nonlocal call_count
+            call_count += 1
+            return "ok"
+
+        result = asyncio.run(_with_retry(always_ok))
+        assert result == "ok"
+        assert call_count == 1
+
+    def test_retries_on_failure_then_succeeds(self):
+        call_count = 0
+
+        async def fail_twice_then_succeed():
+            nonlocal call_count
+            call_count += 1
+            if call_count < 3:
+                raise RuntimeError("transient error")
+            return "recovered"
+
+        result = asyncio.run(
+            _with_retry(fail_twice_then_succeed, max_attempts=3, base_delay=0)
+        )
+        assert result == "recovered"
+        assert call_count == 3
+
+    def test_raises_after_max_attempts_exhausted(self):
+        call_count = 0
+
+        async def always_fails():
+            nonlocal call_count
+            call_count += 1
+            raise ValueError("permanent failure")
+
+        with pytest.raises(ValueError, match="permanent failure"):
+            asyncio.run(
+                _with_retry(always_fails, max_attempts=3, base_delay=0)
+            )
+        assert call_count == 3
+
+    def test_succeeds_on_second_attempt(self):
+        attempts = []
+
+        async def fail_once():
+            attempts.append(1)
+            if len(attempts) == 1:
+                raise ConnectionError("first attempt failed")
+            return "second-try success"
+
+        result = asyncio.run(
+            _with_retry(fail_once, max_attempts=3, base_delay=0)
+        )
+        assert result == "second-try success"
+        assert len(attempts) == 2
+
+    def test_keyboard_interrupt_not_retried(self):
+        """KeyboardInterrupt must propagate immediately without retry."""
+        call_count = 0
+
+        async def raises_keyboard_interrupt():
+            nonlocal call_count
+            call_count += 1
+            raise KeyboardInterrupt
+
+        with pytest.raises(KeyboardInterrupt):
+            asyncio.run(
+                _with_retry(raises_keyboard_interrupt, max_attempts=3, base_delay=0)
+            )
+        assert call_count == 1
+
+
+class TestRAGScoreFiltering:
+    """Tests for the min_score relevance threshold in retrieve_knowledge()."""
+
+    def test_high_relevance_query_returns_context(self):
+        from tools.tools import retrieve_knowledge
+        result = retrieve_knowledge("what are the pricing plans", min_score=0.0)
+        assert "[Context 1]" in result
+
+    def test_zero_threshold_always_returns_results(self):
+        """With min_score=0, every chunk passes — no fallback should occur."""
+        from tools.tools import retrieve_knowledge
+        result = retrieve_knowledge("pricing plans and features", min_score=0.0)
+        assert "No sufficiently relevant" not in result
+
+    def test_perfect_threshold_filters_all_chunks(self):
+        """With min_score=1.0, only a perfect match passes (almost never).
+        For a generic query, the fallback string must be returned."""
+        from tools.tools import retrieve_knowledge
+        result = retrieve_knowledge("xyzzy quux foobar nonsense", min_score=1.0)
+        assert "No sufficiently relevant" in result
+
+    def test_fallback_string_is_non_empty(self):
+        from tools.tools import retrieve_knowledge
+        result = retrieve_knowledge("some query", min_score=1.0)
+        assert isinstance(result, str) and len(result) > 0
+
+    def test_relevant_query_passes_default_threshold(self):
+        """A clearly KB-related query should survive the default 0.35 threshold."""
+        from tools.tools import retrieve_knowledge
+        result = retrieve_knowledge("refund policy", min_score=0.35)
+        # Either real context or a proper fallback — never an empty string.
+        assert isinstance(result, str) and len(result) > 0

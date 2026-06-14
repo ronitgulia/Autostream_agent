@@ -1,5 +1,6 @@
 import os
 import asyncio
+import random
 from enum import Enum
 from typing import Annotated, Literal, List, Optional
 
@@ -12,6 +13,38 @@ from langgraph.graph.message import add_messages
 from tools.tools import retrieve_knowledge, mock_lead_capture
 
 load_dotenv()
+
+
+async def _with_retry(coro_fn, *, max_attempts: int = 3, base_delay: float = 1.0):
+    """Retry an async callable with full-jitter exponential backoff.
+
+    Retries up to ``max_attempts`` times when an exception is raised.  Each
+    wait uses full-jitter: ``sleep(uniform(0, base_delay * 2 ** attempt))``
+    so that concurrent retries do not produce a thundering herd.
+
+    Args:
+        coro_fn:      Zero-argument async callable (lambda or partial) to invoke.
+        max_attempts: Total number of attempts before re-raising.  Default: 3.
+        base_delay:   Base delay in seconds for the backoff formula.  Default: 1.0.
+
+    Returns:
+        The return value of ``coro_fn()`` on success.
+
+    Raises:
+        The last exception raised by ``coro_fn`` after all attempts are exhausted.
+    """
+    last_exc: Exception | None = None
+    for attempt in range(max_attempts):
+        try:
+            return await coro_fn()
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except Exception as exc:  # noqa: BLE001
+            last_exc = exc
+            if attempt < max_attempts - 1:
+                delay = random.uniform(0, base_delay * (2 ** attempt))
+                await asyncio.sleep(delay)
+    raise last_exc  # type: ignore[misc]
 
 
 def _build_llm():
@@ -143,9 +176,11 @@ async def _trim_messages(messages: List[BaseMessage]) -> List[BaseMessage]:
         if isinstance(m, (HumanMessage, AIMessage))
     )
 
-    summary_response = await llm.ainvoke([
-        SystemMessage(content=_SUMMARY_PROMPT.format(history=history_text))
-    ])
+    summary_response = await _with_retry(
+        lambda: llm.ainvoke([
+            SystemMessage(content=_SUMMARY_PROMPT.format(history=history_text))
+        ])
+    )
     summary_msg = SystemMessage(
         content=f"[Conversation Summary — earlier turns]\n{summary_response.content}"
     )
@@ -169,10 +204,12 @@ async def detect_intent(state: AgentState) -> AgentState:
         ""
     )
 
-    result: IntentResponse = await _intent_llm.ainvoke([
-        SystemMessage(content=_INTENT_PROMPT),
-        HumanMessage(content=last_human),
-    ])
+    result: IntentResponse = await _with_retry(
+        lambda: _intent_llm.ainvoke([
+            SystemMessage(content=_INTENT_PROMPT),
+            HumanMessage(content=last_human),
+        ])
+    )
 
     return state.model_copy(update={"intent": result.intent})
 
@@ -197,10 +234,12 @@ mention you'd be happy to share pricing details or help them get started."""
 
 async def greeter_node(state: AgentState) -> AgentState:
     context_msgs = await _trim_messages(state.messages)
-    response = await llm.ainvoke([
-        SystemMessage(content=_GREETER_SYSTEM),
-        *context_msgs,
-    ])
+    response = await _with_retry(
+        lambda: llm.ainvoke([
+            SystemMessage(content=_GREETER_SYSTEM),
+            *context_msgs,
+        ])
+    )
     return state.model_copy(update={"messages": [AIMessage(content=response.content)]})
 
 
@@ -223,10 +262,12 @@ async def rag_answer_node(state: AgentState) -> AgentState:
     context = retrieve_knowledge(last_human)
     context_msgs = await _trim_messages(state.messages)
 
-    response = await llm.ainvoke([
-        SystemMessage(content=_RAG_SYSTEM.format(context=context)),
-        *context_msgs,
-    ])
+    response = await _with_retry(
+        lambda: llm.ainvoke([
+            SystemMessage(content=_RAG_SYSTEM.format(context=context)),
+            *context_msgs,
+        ])
+    )
     return state.model_copy(update={
         "rag_context": context,
         "messages": [AIMessage(content=response.content)],
@@ -268,13 +309,15 @@ async def lead_capture_node(state: AgentState) -> AgentState:
     """
     if state.lead_stage == "done":
         context_msgs = await _trim_messages(state.messages)
-        response = await llm.ainvoke([
-            SystemMessage(
-                content="You are Alex from AutoStream. The user has already signed up as a lead. "
-                        "Be warm, answer any remaining questions, and let them know the team will be in touch."
-            ),
-            *context_msgs,
-        ])
+        response = await _with_retry(
+            lambda: llm.ainvoke([
+                SystemMessage(
+                    content="You are Alex from AutoStream. The user has already signed up as a lead. "
+                            "Be warm, answer any remaining questions, and let them know the team will be in touch."
+                ),
+                *context_msgs,
+            ])
+        )
         return state.model_copy(update={"messages": [AIMessage(content=response.content)]})
 
     last_human = next(
@@ -282,10 +325,12 @@ async def lead_capture_node(state: AgentState) -> AgentState:
         ""
     ).strip()
 
-    extracted: LeadFormSchema = await _extract_llm.ainvoke([
-        SystemMessage(content=_LEAD_EXTRACT_SYSTEM),
-        HumanMessage(content=last_human),
-    ])
+    extracted: LeadFormSchema = await _with_retry(
+        lambda: _extract_llm.ainvoke([
+            SystemMessage(content=_LEAD_EXTRACT_SYSTEM),
+            HumanMessage(content=last_human),
+        ])
+    )
 
     current = state.lead
     name = (extracted.name or "").strip() or current.name
@@ -337,13 +382,15 @@ async def lead_capture_node(state: AgentState) -> AgentState:
     collected_str = ", ".join(collected_parts) if collected_parts else "nothing yet"
     missing_str = " and ".join(missing)
 
-    response = await llm.ainvoke([
-        SystemMessage(content=_LEAD_ASK_SYSTEM.format(
-            collected=collected_str,
-            missing=missing_str,
-        )),
-        *state.messages[-4:],
-    ])
+    response = await _with_retry(
+        lambda: llm.ainvoke([
+            SystemMessage(content=_LEAD_ASK_SYSTEM.format(
+                collected=collected_str,
+                missing=missing_str,
+            )),
+            *state.messages[-4:],
+        ])
+    )
 
     return state.model_copy(update={
         "lead": updated_lead,
