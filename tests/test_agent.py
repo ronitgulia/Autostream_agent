@@ -27,6 +27,7 @@ from agent.agent import (
     _EmailCheck,
     _trim_messages,
     _with_retry,
+    _get_llm,
     KEEP_LAST_N,
 )
 
@@ -241,8 +242,10 @@ class TestTrimMessages:
         mock_response = MagicMock()
         mock_response.content = "User asked about pricing and features."
 
-        with patch("agent.agent.llm") as mock_llm:
-            mock_llm.ainvoke = AsyncMock(return_value=mock_response)
+        mock_llm = MagicMock()
+        mock_llm.ainvoke = AsyncMock(return_value=mock_response)
+
+        with patch("agent.agent._get_llm", return_value=mock_llm):
             result = asyncio.run(_trim_messages(msgs))
 
         assert isinstance(result[0], SystemMessage)
@@ -256,8 +259,10 @@ class TestTrimMessages:
         mock_response = MagicMock()
         mock_response.content = "Summary: user discussed refund policy."
 
-        with patch("agent.agent.llm") as mock_llm:
-            mock_llm.ainvoke = AsyncMock(return_value=mock_response)
+        mock_llm = MagicMock()
+        mock_llm.ainvoke = AsyncMock(return_value=mock_response)
+
+        with patch("agent.agent._get_llm", return_value=mock_llm):
             result = asyncio.run(_trim_messages(msgs))
 
         assert "Summary: user discussed refund policy." in result[0].content

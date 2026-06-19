@@ -2,6 +2,7 @@ import os
 import asyncio
 import random
 from enum import Enum
+from functools import lru_cache
 from typing import Annotated, Literal, List, Optional
 
 from dotenv import load_dotenv
@@ -47,10 +48,18 @@ async def _with_retry(coro_fn, *, max_attempts: int = 3, base_delay: float = 1.0
     raise last_exc  # type: ignore[misc]
 
 
-def _build_llm():
-    """Instantiate the LLM based on the LLM_PROVIDER environment variable.
+@lru_cache(maxsize=1)
+def _get_llm():
+    """Return the cached LLM singleton, instantiated lazily on first call.
 
-    Supported providers: anthropic (default), openai, google, groq.
+    Using ``@lru_cache`` means the provider-specific client (API key reads,
+    HTTP session setup) is created exactly once per process and only when the
+    first LLM call is actually needed — not at import time.  This keeps
+    imports fast and side-effect-free, and lets tests patch ``_get_llm``
+    *before* the real object is ever constructed.
+
+    Supported providers (set via ``LLM_PROVIDER`` env var):
+        anthropic (default), openai, google, groq.
     """
     provider = os.getenv("LLM_PROVIDER", "anthropic").lower()
 
@@ -82,9 +91,6 @@ def _build_llm():
             api_key=os.getenv("ANTHROPIC_API_KEY"),
             temperature=0.3,
         )
-
-
-llm = _build_llm()
 
 
 class Lead(BaseModel):
@@ -177,7 +183,7 @@ async def _trim_messages(messages: List[BaseMessage]) -> List[BaseMessage]:
     )
 
     summary_response = await _with_retry(
-        lambda: llm.ainvoke([
+        lambda: _get_llm().ainvoke([
             SystemMessage(content=_SUMMARY_PROMPT.format(history=history_text))
         ])
     )
@@ -194,7 +200,10 @@ Classify the user's latest message into exactly ONE of these intents:
 - product_inquiry — questions about features, pricing, plans, policies, or how AutoStream works
 - high_intent     — user explicitly wants to sign up, start a trial, buy a plan, or try the product"""
 
-_intent_llm = llm.with_structured_output(IntentResponse)
+@lru_cache(maxsize=1)
+def _get_intent_llm():
+    """Return the cached intent-classification LLM (lazy singleton)."""
+    return _get_llm().with_structured_output(IntentResponse)
 
 
 async def detect_intent(state: AgentState) -> AgentState:
@@ -205,7 +214,7 @@ async def detect_intent(state: AgentState) -> AgentState:
     )
 
     result: IntentResponse = await _with_retry(
-        lambda: _intent_llm.ainvoke([
+        lambda: _get_intent_llm().ainvoke([
             SystemMessage(content=_INTENT_PROMPT),
             HumanMessage(content=last_human),
         ])
@@ -235,7 +244,7 @@ mention you'd be happy to share pricing details or help them get started."""
 async def greeter_node(state: AgentState) -> AgentState:
     context_msgs = await _trim_messages(state.messages)
     response = await _with_retry(
-        lambda: llm.ainvoke([
+        lambda: _get_llm().ainvoke([
             SystemMessage(content=_GREETER_SYSTEM),
             *context_msgs,
         ])
@@ -263,7 +272,7 @@ async def rag_answer_node(state: AgentState) -> AgentState:
     context_msgs = await _trim_messages(state.messages)
 
     response = await _with_retry(
-        lambda: llm.ainvoke([
+        lambda: _get_llm().ainvoke([
             SystemMessage(content=_RAG_SYSTEM.format(context=context)),
             *context_msgs,
         ])
@@ -294,7 +303,10 @@ Ask the user for the missing information in a natural, conversational tone.
 Do NOT ask for or mention fields you already have.
 If multiple fields are missing, you can ask for them together in one friendly message."""
 
-_extract_llm = llm.with_structured_output(LeadFormSchema)
+@lru_cache(maxsize=1)
+def _get_extract_llm():
+    """Return the cached lead-extraction LLM (lazy singleton)."""
+    return _get_llm().with_structured_output(LeadFormSchema)
 
 
 async def lead_capture_node(state: AgentState) -> AgentState:
@@ -310,7 +322,7 @@ async def lead_capture_node(state: AgentState) -> AgentState:
     if state.lead_stage == "done":
         context_msgs = await _trim_messages(state.messages)
         response = await _with_retry(
-            lambda: llm.ainvoke([
+            lambda: _get_llm().ainvoke([
                 SystemMessage(
                     content="You are Alex from AutoStream. The user has already signed up as a lead. "
                             "Be warm, answer any remaining questions, and let them know the team will be in touch."
@@ -326,7 +338,7 @@ async def lead_capture_node(state: AgentState) -> AgentState:
     ).strip()
 
     extracted: LeadFormSchema = await _with_retry(
-        lambda: _extract_llm.ainvoke([
+        lambda: _get_extract_llm().ainvoke([
             SystemMessage(content=_LEAD_EXTRACT_SYSTEM),
             HumanMessage(content=last_human),
         ])
@@ -383,7 +395,7 @@ async def lead_capture_node(state: AgentState) -> AgentState:
     missing_str = " and ".join(missing)
 
     response = await _with_retry(
-        lambda: llm.ainvoke([
+        lambda: _get_llm().ainvoke([
             SystemMessage(content=_LEAD_ASK_SYSTEM.format(
                 collected=collected_str,
                 missing=missing_str,
