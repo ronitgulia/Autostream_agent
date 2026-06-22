@@ -20,14 +20,14 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-from langchain_core.messages import HumanMessage, AIMessage
-from agent.agent import build_graph, AgentState
+from langchain_core.messages import HumanMessage
+from agent.agent import build_graph, AgentState, stream_response
 
 
 BANNER = """
 ╔══════════════════════════════════════════════════════════╗
 ║          AutoStream AI Assistant                         ║
-║  Powered by LangGraph + RAG | Type 'quit' to exit        ║
+║  Powered by LangGraph + Hybrid RAG | Type 'quit' to exit ║
 ╚══════════════════════════════════════════════════════════╝
 """
 
@@ -57,37 +57,17 @@ async def run_cli() -> None:
         print("\nAgent: ", end="", flush=True)
 
         try:
-            final_state = None
-
-            async for event in graph.astream_events(state, version="v2"):
-                kind = event["event"]
-
-                if kind == "on_chat_model_stream":
-                    chunk = event["data"]["chunk"]
-                    content = chunk.content
-
-                    if isinstance(content, str) and content:
-                        print(content, end="", flush=True)
-                    elif isinstance(content, list):
-                        for part in content:
-                            if isinstance(part, dict) and part.get("type") == "text":
-                                text = part.get("text", "")
-                                if text:
-                                    print(text, end="", flush=True)
-
-                elif kind == "on_chain_end" and event.get("name") == "LangGraph":
-                    final_state = event["data"].get("output")
+            async for text, final in stream_response(graph, state):
+                if final is not None:
+                    state = final
+                elif text:
+                    print(text, end="", flush=True)
 
             print("\n")
 
-            if final_state is not None:
-                if isinstance(final_state, dict):
-                    state = AgentState(**final_state)
-                elif isinstance(final_state, AgentState):
-                    state = final_state
-
         except Exception as e:
             print(f"\n\nAgent: Oops, something went wrong — {e}\n")
+            # Roll back the last human message so the state stays consistent.
             state = state.model_copy(update={"messages": state.messages[:-1]})
 
 

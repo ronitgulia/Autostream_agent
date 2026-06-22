@@ -11,7 +11,7 @@ import csv
 import asyncio
 import tempfile
 from pathlib import Path
-from unittest.mock import patch, MagicMock, AsyncMock
+from unittest.mock import patch, MagicMock, AsyncMock, call
 
 import pytest
 from pydantic import ValidationError
@@ -28,8 +28,12 @@ from agent.agent import (
     _trim_messages,
     _with_retry,
     _get_llm,
+    _extract_chunk_text,
     KEEP_LAST_N,
+    _CIRCUIT_BREAKER_THRESHOLD,
 )
+
+
 
 
 def _is_valid_email(raw: str) -> bool:
@@ -40,6 +44,10 @@ def _is_valid_email(raw: str) -> bool:
     except (ValidationError, Exception):
         return False
 
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Email validation
+# ══════════════════════════════════════════════════════════════════════════════
 
 class TestEmailValidation:
     def test_valid_email_accepted(self):
@@ -70,6 +78,10 @@ class TestEmailValidation:
         assert _is_valid_email("   ") is False
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# Intent enum
+# ══════════════════════════════════════════════════════════════════════════════
+
 class TestIntentEnum:
     def test_intent_values_are_strings(self):
         assert Intent.greeting == "greeting"
@@ -89,37 +101,143 @@ class TestIntentEnum:
         assert state.intent == Intent.greeting
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# RAG retrieval (original + hybrid)
+# ══════════════════════════════════════════════════════════════════════════════
+
 class TestRetrieveKnowledge:
+    """All retrieve_knowledge calls must now be awaited (async)."""
+
     def test_direct_pricing_query(self):
         from tools.tools import retrieve_knowledge
-        result = retrieve_knowledge("what are the pricing plans")
+        result = asyncio.run(retrieve_knowledge("what are the pricing plans"))
         assert "$" in result or "month" in result.lower()
 
     def test_semantic_affordability_query(self):
         from tools.tools import retrieve_knowledge
-        result = retrieve_knowledge("Is it affordable?")
+        result = asyncio.run(retrieve_knowledge("Is it affordable?"))
         assert any(kw in result.lower() for kw in ["plan", "$", "month", "cost", "price"])
 
     def test_semantic_video_limits_query(self):
         from tools.tools import retrieve_knowledge
-        result = retrieve_knowledge("Tell me about video limits")
+        result = asyncio.run(retrieve_knowledge("Tell me about video limits"))
         assert any(kw in result.lower() for kw in ["video", "minute", "hour", "limit", "basic", "pro"])
 
     def test_refund_policy_returned(self):
         from tools.tools import retrieve_knowledge
-        result = retrieve_knowledge("what is your refund policy")
+        result = asyncio.run(retrieve_knowledge("what is your refund policy"))
         assert "refund" in result.lower()
 
     def test_result_is_non_empty_string(self):
         from tools.tools import retrieve_knowledge
-        result = retrieve_knowledge("pricing")
+        result = asyncio.run(retrieve_knowledge("pricing"))
         assert isinstance(result, str) and len(result) > 0
 
     def test_fallback_for_nonsense_query(self):
         from tools.tools import retrieve_knowledge
-        result = retrieve_knowledge("xyzzy foobar baz")
+        result = asyncio.run(retrieve_knowledge("xyzzy foobar baz"))
         assert isinstance(result, str) and len(result) > 0
 
+    # ── New: hybrid-specific tests ────────────────────────────────────────────
+
+    def test_exact_price_keyword_found(self):
+        """BM25 should surface the Pro plan chunk when the exact price token appears."""
+        from tools.tools import retrieve_knowledge
+        result = asyncio.run(retrieve_knowledge("79"))
+        # After RRF, the Pro plan chunk ($79/month) should be in the context.
+        assert "79" in result or "pro" in result.lower()
+
+    def test_exact_4k_keyword_found(self):
+        """'4K' is an exact token that BM25 handles better than embeddings alone."""
+        from tools.tools import retrieve_knowledge
+        result = asyncio.run(retrieve_knowledge("4K export resolution"))
+        assert "4k" in result.lower() or "pro" in result.lower()
+
+    def test_hybrid_returns_context_tag(self):
+        """Fused results should still be formatted with [Context N] tags."""
+        from tools.tools import retrieve_knowledge
+        result = asyncio.run(retrieve_knowledge("pricing", min_score=0.0))
+        assert "[Context 1]" in result
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# BM25 index
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestBM25Index:
+    def test_bm25_returns_results(self):
+        from tools.tools import _BM25
+        results = _BM25.query("pricing plan monthly", top_k=3)
+        assert len(results) > 0
+
+    def test_bm25_result_tuple_structure(self):
+        from tools.tools import _BM25
+        results = _BM25.query("refund policy", top_k=2)
+        for doc_id, doc, score in results:
+            assert isinstance(doc_id, str)
+            assert isinstance(doc, str)
+            assert isinstance(score, float)
+
+    def test_bm25_exact_match_scores_higher(self):
+        """'refund' should score higher for a refund query than an unrelated doc."""
+        from tools.tools import _BM25
+        results = _BM25.query("refund policy", top_k=5)
+        top_doc = results[0][1].lower()
+        assert "refund" in top_doc
+
+    def test_bm25_top_k_respected(self):
+        from tools.tools import _BM25
+        results = _BM25.query("any query", top_k=2)
+        assert len(results) <= 2
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# RRF fusion (via tools._rrf_fuse)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestRRFFuse:
+    """Tests for the Reciprocal Rank Fusion helper in tools.py."""
+
+    def _fuse(self, dense_ids, sparse_ids, id_to_doc):
+        from tools.tools import _rrf_fuse
+        return _rrf_fuse(dense_ids, sparse_ids, id_to_doc)
+
+    def test_top_in_both_lists_wins(self):
+        """A doc that ranks #1 in both dense and sparse should be first."""
+        doc_map = {"a": "doc_a", "b": "doc_b", "c": "doc_c"}
+        result = self._fuse(["a", "b", "c"], ["a", "c", "b"], doc_map)
+        assert result[0] == "doc_a"
+
+    def test_ids_only_in_sparse_included(self):
+        """Docs that appear only in sparse (not dense) must still be fused in."""
+        doc_map = {"a": "doc_a", "b": "doc_b"}
+        result = self._fuse(["a"], ["a", "b"], doc_map)
+        assert "doc_b" in result
+
+    def test_ids_only_in_dense_included(self):
+        doc_map = {"a": "doc_a", "b": "doc_b"}
+        result = self._fuse(["a", "b"], ["a"], doc_map)
+        assert "doc_b" in result
+
+    def test_unknown_ids_excluded(self):
+        """IDs not present in id_to_doc must be silently dropped."""
+        doc_map = {"a": "doc_a"}
+        result = self._fuse(["a", "z"], ["a", "x"], doc_map)
+        assert all(d in ["doc_a"] for d in result)
+
+    def test_empty_lists_return_empty(self):
+        result = self._fuse([], [], {})
+        assert result == []
+
+    def test_returns_list_of_strings(self):
+        doc_map = {"a": "text_a", "b": "text_b"}
+        result = self._fuse(["a"], ["b"], doc_map)
+        assert all(isinstance(d, str) for d in result)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Lead CSV persistence
+# ══════════════════════════════════════════════════════════════════════════════
 
 class TestLeadCSVPersistence:
     def test_lead_written_to_csv(self, tmp_path):
@@ -167,6 +285,10 @@ class TestLeadCSVPersistence:
                 tools_module._LEADS_CSV = original_path
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# State copy safety
+# ══════════════════════════════════════════════════════════════════════════════
+
 class TestStateCopySafety:
     def test_model_copy_isolates_messages_list(self):
         state = AgentState()
@@ -182,6 +304,19 @@ class TestStateCopySafety:
         assert state.intent == Intent.greeting
         assert updated.intent == Intent.high_intent
 
+    def test_consecutive_failures_default_zero(self):
+        assert AgentState().consecutive_failures == 0
+
+    def test_consecutive_failures_increments(self):
+        state = AgentState(consecutive_failures=1)
+        updated = state.model_copy(update={"consecutive_failures": 2})
+        assert state.consecutive_failures == 1
+        assert updated.consecutive_failures == 2
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# AI message detection
+# ══════════════════════════════════════════════════════════════════════════════
 
 class TestAIMessageDetection:
     def test_isinstance_detects_ai_message(self):
@@ -215,6 +350,10 @@ class TestAIMessageDetection:
         assert last_ai == "(no response)"
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# Context trimming
+# ══════════════════════════════════════════════════════════════════════════════
+
 class TestTrimMessages:
     def _make_convo(self, n_pairs: int) -> list:
         msgs = []
@@ -245,7 +384,8 @@ class TestTrimMessages:
         mock_llm = MagicMock()
         mock_llm.ainvoke = AsyncMock(return_value=mock_response)
 
-        with patch("agent.agent._get_llm", return_value=mock_llm):
+        with patch("agent.agent._get_llm", return_value=mock_llm), \
+             patch("agent.agent._LLM_INSTANCE", mock_llm):
             result = asyncio.run(_trim_messages(msgs))
 
         assert isinstance(result[0], SystemMessage)
@@ -262,11 +402,16 @@ class TestTrimMessages:
         mock_llm = MagicMock()
         mock_llm.ainvoke = AsyncMock(return_value=mock_response)
 
-        with patch("agent.agent._get_llm", return_value=mock_llm):
+        with patch("agent.agent._get_llm", return_value=mock_llm), \
+             patch("agent.agent._LLM_INSTANCE", mock_llm):
             result = asyncio.run(_trim_messages(msgs))
 
         assert "Summary: user discussed refund policy." in result[0].content
 
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Lead form schema
+# ══════════════════════════════════════════════════════════════════════════════
 
 class TestLeadFormSchema:
     def test_all_fields_present(self):
@@ -304,6 +449,10 @@ class TestLeadFormSchema:
             _EmailCheck(email="not-an-email")
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# Lead stage transitions
+# ══════════════════════════════════════════════════════════════════════════════
+
 class TestLeadStageSimplified:
     def test_default_stage_is_none(self):
         assert AgentState().lead_stage == "none"
@@ -329,6 +478,10 @@ class TestLeadStageSimplified:
         updated = state.model_copy(update={"lead_stage": "done"})
         assert updated.lead_stage == "done"
 
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Retry logic
+# ══════════════════════════════════════════════════════════════════════════════
 
 class TestRetryLogic:
     """Tests for the _with_retry() exponential backoff helper."""
@@ -406,35 +559,236 @@ class TestRetryLogic:
         assert call_count == 1
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# RAG score filtering
+# ══════════════════════════════════════════════════════════════════════════════
+
 class TestRAGScoreFiltering:
     """Tests for the min_score relevance threshold in retrieve_knowledge()."""
 
     def test_high_relevance_query_returns_context(self):
         from tools.tools import retrieve_knowledge
-        result = retrieve_knowledge("what are the pricing plans", min_score=0.0)
+        result = asyncio.run(retrieve_knowledge("what are the pricing plans", min_score=0.0))
         assert "[Context 1]" in result
 
     def test_zero_threshold_always_returns_results(self):
-        """With min_score=0, every chunk passes — no fallback should occur."""
+        """With min_score=0, dense path always passes — no fallback."""
         from tools.tools import retrieve_knowledge
-        result = retrieve_knowledge("pricing plans and features", min_score=0.0)
+        result = asyncio.run(retrieve_knowledge("pricing plans and features", min_score=0.0))
         assert "No sufficiently relevant" not in result
 
-    def test_perfect_threshold_filters_all_chunks(self):
-        """With min_score=1.0, only a perfect match passes (almost never).
-        For a generic query, the fallback string must be returned."""
+    def test_perfect_threshold_still_has_sparse_fallback(self):
+        """With min_score=1.0, dense path returns nothing but BM25 sparse results
+        can still contribute via RRF — so relevant queries may still get context."""
         from tools.tools import retrieve_knowledge
-        result = retrieve_knowledge("xyzzy quux foobar nonsense", min_score=1.0)
-        assert "No sufficiently relevant" in result
+        result = asyncio.run(retrieve_knowledge("xyzzy quux foobar nonsense", min_score=1.0))
+        # Either real sparse context or the proper fallback — never empty.
+        assert isinstance(result, str) and len(result) > 0
 
     def test_fallback_string_is_non_empty(self):
         from tools.tools import retrieve_knowledge
-        result = retrieve_knowledge("some query", min_score=1.0)
+        result = asyncio.run(retrieve_knowledge("some query", min_score=1.0))
         assert isinstance(result, str) and len(result) > 0
 
     def test_relevant_query_passes_default_threshold(self):
         """A clearly KB-related query should survive the default 0.35 threshold."""
         from tools.tools import retrieve_knowledge
-        result = retrieve_knowledge("refund policy", min_score=0.35)
-        # Either real context or a proper fallback — never an empty string.
+        result = asyncio.run(retrieve_knowledge("refund policy", min_score=0.35))
         assert isinstance(result, str) and len(result) > 0
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Improvement 4 — _extract_chunk_text utility
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestExtractChunkText:
+    """Unit tests for the provider-agnostic chunk text extractor."""
+
+    def _make_chunk(self, content):
+        chunk = MagicMock()
+        chunk.content = content
+        return chunk
+
+    def test_string_content_returned_directly(self):
+        chunk = self._make_chunk("Hello, world!")
+        assert _extract_chunk_text(chunk) == "Hello, world!"
+
+    def test_empty_string_content(self):
+        chunk = self._make_chunk("")
+        assert _extract_chunk_text(chunk) == ""
+
+    def test_google_list_content_extracted(self):
+        """Gemini returns content as list[dict] with type/text pairs."""
+        chunk = self._make_chunk([
+            {"type": "text", "text": "Hello "},
+            {"type": "text", "text": "world"},
+        ])
+        assert _extract_chunk_text(chunk) == "Hello world"
+
+    def test_list_with_non_text_items_skipped(self):
+        chunk = self._make_chunk([
+            {"type": "tool_use", "id": "123"},
+            {"type": "text", "text": "visible"},
+        ])
+        assert _extract_chunk_text(chunk) == "visible"
+
+    def test_empty_list_returns_empty_string(self):
+        chunk = self._make_chunk([])
+        assert _extract_chunk_text(chunk) == ""
+
+    def test_none_content_returns_empty_string(self):
+        chunk = self._make_chunk(None)
+        assert _extract_chunk_text(chunk) == ""
+
+    def test_unexpected_type_returns_empty_string(self):
+        chunk = self._make_chunk(12345)
+        assert _extract_chunk_text(chunk) == ""
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Improvement 3 — Circuit breaker
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestCircuitBreaker:
+    """Tests for the consecutive_failures circuit breaker in AgentState."""
+
+    def test_circuit_open_at_threshold(self):
+        from agent.agent import _check_circuit_breaker
+        state = AgentState(consecutive_failures=_CIRCUIT_BREAKER_THRESHOLD)
+        result = _check_circuit_breaker(state)
+        assert result is not None
+        assert "trouble" in result.lower() or "try again" in result.lower()
+
+    def test_circuit_closed_below_threshold(self):
+        from agent.agent import _check_circuit_breaker
+        state = AgentState(consecutive_failures=_CIRCUIT_BREAKER_THRESHOLD - 1)
+        assert _check_circuit_breaker(state) is None
+
+    def test_circuit_closed_at_zero(self):
+        from agent.agent import _check_circuit_breaker
+        state = AgentState(consecutive_failures=0)
+        assert _check_circuit_breaker(state) is None
+
+    def test_circuit_message_is_string(self):
+        from agent.agent import _check_circuit_breaker
+        state = AgentState(consecutive_failures=_CIRCUIT_BREAKER_THRESHOLD)
+        msg = _check_circuit_breaker(state)
+        assert isinstance(msg, str) and len(msg) > 0
+
+    def test_failures_reset_after_circuit_opens(self):
+        """Simulate detect_intent node resetting consecutive_failures to 0."""
+        state = AgentState(consecutive_failures=_CIRCUIT_BREAKER_THRESHOLD)
+        # After the circuit fires, the node resets to 0.
+        updated = state.model_copy(update={"consecutive_failures": 0})
+        assert updated.consecutive_failures == 0
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Improvement 3 — Safe intent detection fallback
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestSafeDetectIntent:
+    """Tests for _safe_detect_intent's graceful fallback behaviour."""
+
+    def test_returns_intent_response_on_success(self):
+        from agent.agent import _safe_detect_intent, IntentResponse
+
+        mock_result = IntentResponse(intent=Intent.product_inquiry)
+        mock_llm = MagicMock()
+        mock_llm.ainvoke = AsyncMock(return_value=mock_result)
+
+        state = AgentState(messages=[HumanMessage(content="What are the plans?")])
+
+        with patch("agent.agent._get_intent_llm", return_value=mock_llm):
+            result = asyncio.run(_safe_detect_intent(state))
+
+        assert result.intent == Intent.product_inquiry
+
+    def test_falls_back_to_product_inquiry_on_llm_failure(self):
+        """When the LLM raises repeatedly, the safe fallback must be product_inquiry."""
+        from agent.agent import _safe_detect_intent
+
+        mock_llm = MagicMock()
+        mock_llm.ainvoke = AsyncMock(side_effect=RuntimeError("API unavailable"))
+
+        state = AgentState(messages=[HumanMessage(content="some message")])
+
+        with patch("agent.agent._get_intent_llm", return_value=mock_llm), \
+             patch("agent.agent._with_retry", AsyncMock(side_effect=RuntimeError("API unavailable"))):
+            result = asyncio.run(_safe_detect_intent(state))
+
+        assert result.intent == Intent.product_inquiry
+
+    def test_fallback_uses_product_inquiry_not_greeting(self):
+        """product_inquiry is the safer default — it routes to RAG, not a silent greeting."""
+        from agent.agent import _safe_detect_intent
+
+        state = AgentState(messages=[HumanMessage(content="hello")])
+
+        with patch("agent.agent._with_retry", AsyncMock(side_effect=Exception("fail"))):
+            result = asyncio.run(_safe_detect_intent(state))
+
+        assert result.intent == Intent.product_inquiry
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Improvement 3 — Safe lead extraction fallback
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestSafeExtractLead:
+    def test_returns_schema_on_success(self):
+        from agent.agent import _safe_extract_lead
+
+        expected = LeadFormSchema(name="Alice", email="alice@example.com", platform="YouTube")
+        mock_llm = MagicMock()
+        mock_llm.ainvoke = AsyncMock(return_value=expected)
+
+        with patch("agent.agent._get_extract_llm", return_value=mock_llm):
+            result = asyncio.run(_safe_extract_lead("Alice, alice@example.com, YouTube"))
+
+        assert result.name == "Alice"
+
+    def test_returns_empty_schema_on_failure(self):
+        """On LLM failure, _safe_extract_lead must return all-None schema."""
+        from agent.agent import _safe_extract_lead
+
+        with patch("agent.agent._with_retry", AsyncMock(side_effect=Exception("fail"))):
+            result = asyncio.run(_safe_extract_lead("some message"))
+
+        assert result.name is None
+        assert result.email is None
+        assert result.platform is None
+
+    def test_empty_schema_is_lead_form_schema_type(self):
+        from agent.agent import _safe_extract_lead
+
+        with patch("agent.agent._with_retry", AsyncMock(side_effect=Exception("fail"))):
+            result = asyncio.run(_safe_extract_lead("test"))
+
+        assert isinstance(result, LeadFormSchema)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Improvement 5 — Intent classifier temperature & few-shot
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestIntentClassifierConfig:
+    def test_intent_prompt_contains_few_shot_examples(self):
+        from agent.agent import _INTENT_PROMPT
+        # Must have at least one example per class
+        assert "greeting" in _INTENT_PROMPT
+        assert "product_inquiry" in _INTENT_PROMPT
+        assert "high_intent" in _INTENT_PROMPT
+        # The examples section should be present
+        assert "EXAMPLES" in _INTENT_PROMPT or "→" in _INTENT_PROMPT
+
+    def test_intent_prompt_contains_all_three_class_labels(self):
+        from agent.agent import _INTENT_PROMPT
+        for label in ("greeting", "product_inquiry", "high_intent"):
+            assert label in _INTENT_PROMPT
+
+    def test_intent_prompt_has_at_least_6_example_lines(self):
+        """The few-shot section should have at least 6 annotated examples."""
+        from agent.agent import _INTENT_PROMPT
+        arrow_count = _INTENT_PROMPT.count("→")
+        assert arrow_count >= 6, f"Expected ≥6 few-shot arrows, found {arrow_count}"

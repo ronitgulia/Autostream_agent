@@ -18,6 +18,7 @@ pydantic[email]>=2.0.0          # EmailStr for Lead model (requires email-valida
 # ── Vector Store + Embeddings (semantic RAG) ──────────────────────────────────
 chromadb>=0.5.0                 # Persistent local vector database
 sentence-transformers>=3.0.0    # all-MiniLM-L6-v2 local embedding model (no API key)
+rank-bm25>=0.2.2                # BM25 sparse retrieval for hybrid RRF reranking
 
 # ── Utilities ─────────────────────────────────────────────────────────────────
 python-dotenv>=1.0.0            # Load .env variables
