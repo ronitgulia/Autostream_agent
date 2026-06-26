@@ -57,19 +57,28 @@ cp .env.example .env
 Open `.env` and set your preferred LLM provider and API key:
 
 ```env
-LLM_PROVIDER=anthropic            # or: openai | google
-ANTHROPIC_API_KEY=sk-ant-...      # Claude 3 Haiku (default)
+LLM_PROVIDER=anthropic            # Options: anthropic | openai | google | groq
+# Optional model override (defaults: claude-3-5-haiku-latest, gpt-4o-mini, gemini-2.0-flash, llama-3.3-70b-versatile)
+# LLM_MODEL=claude-3-5-haiku-latest
+
+ANTHROPIC_API_KEY=sk-ant-...      # Claude 3.5 Haiku (default)
 # OPENAI_API_KEY=sk-...           # GPT-4o-mini (alternative)
-# GOOGLE_API_KEY=AIza...          # Gemini 1.5 Flash (alternative)
+# GOOGLE_API_KEY=AIza...          # Gemini 2.0 Flash (alternative)
+# GROQ_API_KEY=gsk_...            # Llama-3.3-70b (alternative)
 ```
 
 ### 5. Run the agent
 
 ```bash
+# Run with defaults
 python main.py
+
+# Or customize provider, model, and logging via CLI flags
+python main.py --provider openai --model gpt-4o-mini
+python main.py --debug
 ```
 
-You'll see an interactive CLI. Type your messages and press Enter. Type `quit` to exit.
+You'll see an interactive CLI with real-time token streaming. Type your messages and press Enter. Type `quit` to exit.
 
 ---
 
@@ -107,16 +116,18 @@ LangGraph was chosen over AutoGen because it offers **explicit, inspectable stat
 
 ### Graph Structure
 
-The agent is built as a **directed acyclic graph** with four nodes:
+The agent is built as a **directed state graph** with four nodes:
 
-1. **`intent_detector`** — Every user message first passes through an LLM-powered intent classifier that labels it as `greeting`, `product_inquiry`, or `high_intent`.
+1. **`intent_detector`** — Every user message first passes through a zero-temperature LLM intent classifier with few-shot anchoring that deterministically labels it as `greeting`, `product_inquiry`, or `high_intent`. Built-in circuit breaking trips if consecutive LLM failures exceed threshold.
 2. **`greeter`** — Handles casual conversation using a system-prompted LLM response.
-3. **`rag_answer`** — Performs keyword-based RAG retrieval from `autostream_kb.json`, injects the context into the LLM prompt, and returns an accurate answer.
-4. **`lead_capture`** — A **multi-step state machine** (sub-FSM inside the node) that advances through `collecting_name → collecting_email → collecting_platform → done`, only calling `mock_lead_capture()` once all three fields are validated and collected.
+3. **`rag_answer`** — Runs parallel retrieval and history trimming, injecting hybrid RAG context into the LLM prompt. Also serves post-signup questions with reassuring context.
+4. **`lead_capture`** — Structured form extractor validating fields with Pydantic (`EmailStr`). Supports **interruptible conversation flow**: if a user asks a product question mid-collection, the agent retrieves RAG context, answers accurately, and gently resumes collecting missing fields. Only triggers `mock_lead_capture()` once all three fields are valid.
 
-### State Management
+### State & Memory Management
 
-The full `AgentState` TypedDict is passed through and returned from every node, ensuring **persistent memory across 5–6 conversation turns** with no loss of context. The `messages` list (using LangGraph's `add_messages` reducer) accumulates the complete conversation history, which is replayed to the LLM on each turn for coherent multi-turn dialogue.
+- **Pydantic Validation**: Full `AgentState` model backed by Pydantic v2 ensuring strict runtime validation across all nodes.
+- **Sliding-Window Memory**: Context trimming automatically summarizes exchanges older than `KEEP_LAST_N=10` turns into a system summary while pruning historical messages, preventing quadratic token inflation over extended dialogues.
+- **Hybrid RAG & Lazy Loading**: Combines dense semantic search (ChromaDB + `all-MiniLM-L6-v2`) and sparse keyword matching (BM25) fused via Reciprocal Rank Fusion (RRF). Lazy thread-safe singletons ensure near-instant cold start without blocking module imports.
 
 ---
 
@@ -175,11 +186,12 @@ WhatsApp User receives reply
 
 | Criterion | Implementation |
 |---|---|
-| Intent detection | LLM classifier node with 3-label output |
-| RAG | Keyword-based retrieval from `autostream_kb.json` |
-| State management | `AgentState` TypedDict persisted across turns via LangGraph |
-| Tool calling logic | `mock_lead_capture()` only fires after all 3 fields are collected |
-| Code clarity | Modular structure: `agent/`, `tools/`, `knowledge_base/` |
+| Intent detection | LLM classifier node with temperature=0 and few-shot examples |
+| RAG | Hybrid retrieval (ChromaDB dense + BM25 sparse fused with RRF) with lazy loading |
+| State management | `AgentState` Pydantic v2 model with sliding-window summarization |
+| Tool calling logic | `mock_lead_capture()` fires once all 3 fields are valid; persists to `leads.csv` |
+| Code clarity | Clean architecture: `agent/`, `tools/`, `knowledge_base/`, typed schemas |
+| Conversational flow | Handles interruptions & product inquiries seamlessly during lead collection |
 | Deployability | WhatsApp webhook architecture documented above |
 
 ---
@@ -188,11 +200,12 @@ WhatsApp User receives reply
 
 | Component | Choice | Reason |
 |---|---|---|
-| Language | Python 3.9+ | Requirement |
-| Framework | LangGraph | Deterministic state graph, superior state management |
-| LLM | Claude 3 Haiku (default) | Fast, cost-efficient, instruction-following |
-| Knowledge Base | Local JSON | Simple, no external vector DB needed for this scale |
-| State | `AgentState` TypedDict | Full conversation + lead data persisted across turns |
+| Language | Python 3.10+ | Type hinting, async generators, modern standard library |
+| Framework | LangGraph + LangChain Core | Deterministic state machine, graph routing, token streaming |
+| LLM | Claude 3.5 Haiku (default) / OpenAI / Gemini / Groq | Pluggable multi-provider factory with `LLM_MODEL` overrides |
+| Vector Store | ChromaDB + sentence-transformers | Local persistent vector search (`all-MiniLM-L6-v2`) |
+| Sparse Search | Rank-BM25 | Keyword lexical retrieval fused via Reciprocal Rank Fusion |
+| Data Validation | Pydantic v2 + EmailStr | Robust schema validation with automatic email normalization |
 
 ---
 
