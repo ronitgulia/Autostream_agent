@@ -877,3 +877,55 @@ class TestLazyRAGInitialization:
         assert isinstance(tools_mod._ALL_DOCS, list)
         assert isinstance(tools_mod._ALL_IDS, list)
         assert tools_mod._BM25 is not None
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Conversational Routing & Interrupted Lead Flow
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestConversationalRoutingAndInterruption:
+    def test_route_done_stage_product_inquiry_to_rag(self):
+        from agent.agent import route, AgentState, Intent
+
+        state = AgentState(lead_stage="done", intent=Intent.product_inquiry)
+        assert route(state) == "rag_answer"
+
+    def test_route_done_stage_greeting_to_greeter(self):
+        from agent.agent import route, AgentState, Intent
+
+        state = AgentState(lead_stage="done", intent=Intent.greeting)
+        assert route(state) == "greeter"
+
+    def test_route_collecting_stage_routes_to_lead_capture(self):
+        from agent.agent import route, AgentState, Intent
+
+        state = AgentState(lead_stage="collecting", intent=Intent.product_inquiry)
+        assert route(state) == "lead_capture"
+
+    def test_lead_capture_answers_question_while_collecting(self):
+        from agent.agent import lead_capture_node, AgentState, Intent, Lead, LeadFormSchema
+
+        state = AgentState(
+            lead_stage="collecting",
+            intent=Intent.product_inquiry,
+            lead=Lead(name="Riya", email="", platform=""),
+            messages=[
+                HumanMessage(content="Does the Pro plan support 4K exports?")
+            ],
+        )
+
+        mock_llm = MagicMock()
+        mock_response = MagicMock(content="Yes, the Pro plan supports 4K! What is your email?")
+        mock_llm.ainvoke = AsyncMock(return_value=mock_response)
+
+        mock_extract = LeadFormSchema(name=None, email=None, platform=None)
+
+        with patch("agent.agent._safe_extract_lead", AsyncMock(return_value=mock_extract)), \
+             patch("agent.agent._get_llm_async", AsyncMock(return_value=mock_llm)), \
+             patch("agent.agent.retrieve_knowledge", AsyncMock(return_value="Pro plan: 4K export")):
+            new_state = asyncio.run(lead_capture_node(state))
+
+        assert new_state.lead.name == "Riya"
+        assert new_state.lead_stage == "collecting"
+        assert "4K" in new_state.messages[-1].content
+        assert new_state.rag_context == "Pro plan: 4K export"

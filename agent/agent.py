@@ -320,8 +320,9 @@ async def _trim_messages(messages: List[BaseMessage]) -> Tuple[List[BaseMessage]
             SystemMessage(content=_SUMMARY_PROMPT.format(history=history_text))
         ])
     )
+    summary_content = _extract_chunk_text(summary_response) or str(summary_response.content)
     summary_msg = SystemMessage(
-        content=f"[Conversation Summary — earlier turns]\n{summary_response.content}"
+        content=f"[Conversation Summary — earlier turns]\n{summary_content}"
     )
     
     state_updates = [RemoveMessage(id=m.id) for m in older if getattr(m, "id", None) is not None] + [summary_msg]
@@ -481,7 +482,14 @@ def route(state: AgentState) -> Literal["greeter", "rag_answer", "lead_capture",
     """Route to the appropriate node based on intent and lead stage."""
     if state.error_state:
         return END
-    if state.lead_stage in ("collecting", "done"):
+    if state.lead_stage == "done":
+        # Ground product questions in RAG even after lead capture is completed
+        if state.intent == Intent.product_inquiry:
+            return "rag_answer"
+        if state.intent == Intent.greeting:
+            return "greeter"
+        return "lead_capture"
+    if state.lead_stage == "collecting":
         return "lead_capture"
     if state.intent == Intent.high_intent:
         return "lead_capture"
@@ -535,6 +543,16 @@ KNOWLEDGE BASE CONTEXT:
 {context}
 """
 
+_RAG_SYSTEM_POST_SIGNUP = """You are Alex, a knowledgeable sales assistant for AutoStream —
+an AI-powered video editing SaaS. The user has already submitted their sign-up information!
+
+Answer the user's question accurately using ONLY the knowledge base context provided below.
+Be concise, warm, and helpful. Reassure them that our team will reach out shortly to assist them.
+
+KNOWLEDGE BASE CONTEXT:
+{context}
+"""
+
 
 async def rag_answer_node(state: AgentState) -> AgentState:
     """Answer product questions with hybrid-retrieved context.
@@ -555,11 +573,12 @@ async def rag_answer_node(state: AgentState) -> AgentState:
     )
     context_msgs, state_updates = trim_result
 
+    rag_prompt = _RAG_SYSTEM_POST_SIGNUP if state.lead_stage == "done" else _RAG_SYSTEM
     llm = await _get_llm_async()
     try:
         response = await _with_retry(
             lambda: llm.ainvoke([
-                SystemMessage(content=_RAG_SYSTEM.format(context=context)),
+                SystemMessage(content=rag_prompt.format(context=context)),
                 *context_msgs,
             ])
         )
@@ -604,17 +623,33 @@ Ask the user for the missing information in a natural, conversational tone.
 Do NOT ask for or mention fields you already have.
 If multiple fields are missing, you can ask for them together in one friendly message."""
 
+_LEAD_ASK_WITH_CONTEXT_SYSTEM = """You are Alex, a warm and helpful sales assistant for AutoStream — \
+an AI-powered video editing SaaS for content creators.
+
+The user is in the middle of signing up for AutoStream, but just asked a specific question:
+"{question}"
+
+Answer their question accurately and concisely using ONLY the following knowledge base context:
+{context}
+
+After answering their question, warmly encourage them to continue their sign-up.
+Already collected: {collected}
+Still needed: {missing}
+Ask for the missing information naturally in the same friendly response."""
+
 
 async def lead_capture_node(state: AgentState) -> AgentState:
-    """LLM-driven lead form filling.
+    """LLM-driven lead form filling with support for mid-flow product questions.
 
     Each turn:
       1. Extracts any name/email/platform values from the user's message
          (with safe fallback on LLM failure).
       2. Merges extracted values with existing lead data.
       3. Validates the email via _EmailCheck.
-      4. Asks for any still-missing fields naturally.
-      5. Fires mock_lead_capture() once all three fields are present and valid.
+      4. If the user asked a question (product_inquiry), retrieves RAG context
+         to answer it directly without losing lead state.
+      5. Asks for any still-missing fields naturally.
+      6. Fires mock_lead_capture() once all three fields are present and valid.
     """
     if state.lead_stage == "done":
         context_msgs, state_updates = await _trim_messages(state.messages)
@@ -701,22 +736,39 @@ async def lead_capture_node(state: AgentState) -> AgentState:
     collected_str = ", ".join(collected_parts) if collected_parts else "nothing yet"
     missing_str = " and ".join(missing)
 
+    # Context retrieval for interruptions / product questions during lead collection
+    rag_context = ""
+    if state.intent == Intent.product_inquiry and last_human:
+        rag_context = await retrieve_knowledge(last_human)
+
+    context_msgs, state_updates = await _trim_messages(state.messages)
     llm = await _get_llm_async()
     try:
+        if rag_context:
+            system_prompt = _LEAD_ASK_WITH_CONTEXT_SYSTEM.format(
+                question=last_human,
+                context=rag_context,
+                collected=collected_str,
+                missing=missing_str,
+            )
+        else:
+            system_prompt = _LEAD_ASK_SYSTEM.format(
+                collected=collected_str,
+                missing=missing_str,
+            )
+
         response = await _with_retry(
             lambda: llm.ainvoke([
-                SystemMessage(content=_LEAD_ASK_SYSTEM.format(
-                    collected=collected_str,
-                    missing=missing_str,
-                )),
-                *state.messages[-4:],
+                SystemMessage(content=system_prompt),
+                *context_msgs[-4:],
             ])
         )
         return state.model_copy(update={
             "consecutive_failures": 0,
             "lead": updated_lead,
             "lead_stage": "collecting",
-            "messages": [AIMessage(content=response.content)],
+            "rag_context": rag_context,
+            "messages": state_updates + [AIMessage(content=response.content)],
         })
     except Exception as exc:
         logger.error("[lead_capture/ask] Failed after retries: %s", exc)
