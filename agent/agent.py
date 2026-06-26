@@ -69,6 +69,69 @@ def _get_or_create_lock() -> asyncio.Lock:
     return _LLM_LOCK
 
 
+def _create_llm_instance(
+    provider: Optional[str] = None,
+    model: Optional[str] = None,
+    temperature: float = 0.3,
+):
+    """Factory creating an authenticated ChatModel instance based on config."""
+    provider = (provider or os.getenv("LLM_PROVIDER", "anthropic")).lower()
+    custom_model = model or os.getenv("LLM_MODEL")
+
+    if provider == "openai":
+        api_key = os.getenv("OPENAI_API_KEY")
+        if not api_key:
+            raise ValueError("OPENAI_API_KEY environment variable is missing or empty.")
+        try:
+            from langchain_openai import ChatOpenAI
+        except ImportError as e:
+            raise ImportError("langchain-openai is not installed. Run 'pip install langchain-openai'.") from e
+        return ChatOpenAI(
+            model=custom_model or "gpt-4o-mini",
+            api_key=api_key,
+            temperature=temperature,
+        )
+    elif provider == "google":
+        api_key = os.getenv("GOOGLE_API_KEY")
+        if not api_key:
+            raise ValueError("GOOGLE_API_KEY environment variable is missing or empty.")
+        try:
+            from langchain_google_genai import ChatGoogleGenerativeAI
+        except ImportError as e:
+            raise ImportError("langchain-google-genai is not installed. Run 'pip install langchain-google-genai'.") from e
+        return ChatGoogleGenerativeAI(
+            model=custom_model or "gemini-2.0-flash",
+            google_api_key=api_key,
+            temperature=temperature,
+        )
+    elif provider == "groq":
+        api_key = os.getenv("GROQ_API_KEY")
+        if not api_key:
+            raise ValueError("GROQ_API_KEY environment variable is missing or empty.")
+        try:
+            from langchain_groq import ChatGroq
+        except ImportError as e:
+            raise ImportError("langchain-groq is not installed. Run 'pip install langchain-groq'.") from e
+        return ChatGroq(
+            model=custom_model or "llama-3.3-70b-versatile",
+            api_key=api_key,
+            temperature=temperature,
+        )
+    else:
+        api_key = os.getenv("ANTHROPIC_API_KEY")
+        if not api_key:
+            raise ValueError("ANTHROPIC_API_KEY environment variable is missing or empty.")
+        try:
+            from langchain_anthropic import ChatAnthropic
+        except ImportError as e:
+            raise ImportError("langchain-anthropic is not installed. Run 'pip install langchain-anthropic'.") from e
+        return ChatAnthropic(
+            model=custom_model or "claude-3-5-haiku-latest",
+            api_key=api_key,
+            temperature=temperature,
+        )
+
+
 async def _get_llm_async():
     """Return (or lazily construct) the shared LLM singleton.
 
@@ -88,37 +151,7 @@ async def _get_llm_async():
         # while we were waiting for the lock.
         if _LLM_INSTANCE is not None:
             return _LLM_INSTANCE
-
-        provider = os.getenv("LLM_PROVIDER", "anthropic").lower()
-
-        if provider == "openai":
-            from langchain_openai import ChatOpenAI
-            _LLM_INSTANCE = ChatOpenAI(
-                model="gpt-4o-mini",
-                api_key=os.getenv("OPENAI_API_KEY"),
-                temperature=0.3,
-            )
-        elif provider == "google":
-            from langchain_google_genai import ChatGoogleGenerativeAI
-            _LLM_INSTANCE = ChatGoogleGenerativeAI(
-                model="gemini-2.0-flash",
-                google_api_key=os.getenv("GOOGLE_API_KEY"),
-                temperature=0.3,
-            )
-        elif provider == "groq":
-            from langchain_groq import ChatGroq
-            _LLM_INSTANCE = ChatGroq(
-                model="llama-3.3-70b-versatile",
-                api_key=os.getenv("GROQ_API_KEY"),
-                temperature=0.3,
-            )
-        else:
-            from langchain_anthropic import ChatAnthropic
-            _LLM_INSTANCE = ChatAnthropic(
-                model="claude-haiku-4-5-20251001",
-                api_key=os.getenv("ANTHROPIC_API_KEY"),
-                temperature=0.3,
-            )
+        _LLM_INSTANCE = _create_llm_instance()
 
     return _LLM_INSTANCE
 
@@ -133,38 +166,7 @@ def _get_llm():
     global _LLM_INSTANCE
     if _LLM_INSTANCE is not None:
         return _LLM_INSTANCE
-
-    provider = os.getenv("LLM_PROVIDER", "anthropic").lower()
-
-    if provider == "openai":
-        from langchain_openai import ChatOpenAI
-        _LLM_INSTANCE = ChatOpenAI(
-            model="gpt-4o-mini",
-            api_key=os.getenv("OPENAI_API_KEY"),
-            temperature=0.3,
-        )
-    elif provider == "google":
-        from langchain_google_genai import ChatGoogleGenerativeAI
-        _LLM_INSTANCE = ChatGoogleGenerativeAI(
-            model="gemini-2.0-flash",
-            google_api_key=os.getenv("GOOGLE_API_KEY"),
-            temperature=0.3,
-        )
-    elif provider == "groq":
-        from langchain_groq import ChatGroq
-        _LLM_INSTANCE = ChatGroq(
-            model="llama-3.3-70b-versatile",
-            api_key=os.getenv("GROQ_API_KEY"),
-            temperature=0.3,
-        )
-    else:
-        from langchain_anthropic import ChatAnthropic
-        _LLM_INSTANCE = ChatAnthropic(
-            model="claude-haiku-4-5-20251001",
-            api_key=os.getenv("ANTHROPIC_API_KEY"),
-            temperature=0.3,
-        )
-
+    _LLM_INSTANCE = _create_llm_instance()
     return _LLM_INSTANCE
 
 
@@ -357,19 +359,21 @@ _INTENT_LLM_INSTANCE = None
 def _get_intent_llm():
     """Return the cached intent-classification LLM (lazy singleton, temperature=0).
 
-    We clone the base LLM with ``temperature=0`` so the classifier is fully
-    deterministic — the same borderline message always resolves to the same label.
+    We instantiate or clone the base LLM with ``temperature=0`` so the classifier
+    is fully deterministic — the same borderline message always resolves to the same label.
     The structured output wrapper is applied here so callers get an
     ``IntentResponse`` object directly.
     """
     global _INTENT_LLM_INSTANCE
     if _INTENT_LLM_INSTANCE is None:
-        base = _get_llm()
-        # bind_tools / with_config temperature override — works across providers.
         try:
-            cold = base.bind(temperature=0)
+            cold = _create_llm_instance(temperature=0.0)
         except Exception:
-            cold = base  # fallback: provider doesn't support bind-time temperature
+            base = _get_llm()
+            try:
+                cold = base.bind(temperature=0)
+            except Exception:
+                cold = base
         _INTENT_LLM_INSTANCE = cold.with_structured_output(IntentResponse)
     return _INTENT_LLM_INSTANCE
 

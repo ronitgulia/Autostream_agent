@@ -797,3 +797,52 @@ class TestIntentClassifierConfig:
         from agent.agent import _INTENT_PROMPT
         arrow_count = _INTENT_PROMPT.count("→")
         assert arrow_count >= 6, f"Expected ≥6 few-shot arrows, found {arrow_count}"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# LLM Factory & Provider Configuration
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestLLMFactoryAndConfiguration:
+    def test_missing_api_key_raises_informative_error(self, monkeypatch):
+        from agent.agent import _create_llm_instance
+
+        monkeypatch.setenv("LLM_PROVIDER", "anthropic")
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        with pytest.raises(ValueError, match="ANTHROPIC_API_KEY environment variable is missing"):
+            _create_llm_instance()
+
+        monkeypatch.setenv("LLM_PROVIDER", "openai")
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        with pytest.raises(ValueError, match="OPENAI_API_KEY environment variable is missing"):
+            _create_llm_instance()
+
+    def test_custom_model_override_respected(self, monkeypatch):
+        from agent.agent import _create_llm_instance
+
+        monkeypatch.setenv("LLM_PROVIDER", "openai")
+        monkeypatch.setenv("OPENAI_API_KEY", "dummy-key")
+        monkeypatch.setenv("LLM_MODEL", "gpt-4o")
+
+        llm = _create_llm_instance()
+        assert getattr(llm, "model_name", None) == "gpt-4o" or getattr(llm, "model", None) == "gpt-4o"
+
+    def test_anthropic_default_model_is_valid(self, monkeypatch):
+        from agent.agent import _create_llm_instance
+        import sys
+
+        mock_anthropic_mod = MagicMock()
+        mock_cls = MagicMock()
+        mock_anthropic_mod.ChatAnthropic = mock_cls
+
+        monkeypatch.setitem(sys.modules, "langchain_anthropic", mock_anthropic_mod)
+        monkeypatch.setenv("LLM_PROVIDER", "anthropic")
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "dummy-key")
+        monkeypatch.delenv("LLM_MODEL", raising=False)
+
+        _create_llm_instance()
+        mock_cls.assert_called_once_with(
+            model="claude-3-5-haiku-latest",
+            api_key="dummy-key",
+            temperature=0.3,
+        )
