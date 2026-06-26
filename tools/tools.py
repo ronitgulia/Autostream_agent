@@ -20,6 +20,9 @@ Improvements over v1:
 import asyncio
 import csv
 import json
+import logging
+import os
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -28,23 +31,37 @@ import chromadb
 from chromadb.utils import embedding_functions
 from rank_bm25 import BM25Okapi
 
+logger = logging.getLogger(__name__)
+
 
 # ── Paths ──────────────────────────────────────────────────────────────────────
 
 _KB_PATH = Path(__file__).parent.parent / "knowledge_base" / "autostream_kb.json"
-_CHROMA_PATH = Path(__file__).parent.parent / ".chroma_db"
+_CHROMA_PATH = Path(os.getenv("CHROMA_DB_PATH", str(Path(__file__).parent.parent / ".chroma_db")))
 _LEADS_CSV = Path(__file__).parent.parent / "leads.csv"
 _CSV_HEADERS = ["timestamp", "name", "email", "platform"]
+
+# ── Lazy State Singletons ──────────────────────────────────────────────────────
+
+_KB_CACHE: Optional[dict] = None
+_VECTORSTORE_CACHE: Optional[tuple[chromadb.Collection, list[str], list[str]]] = None
+_BM25_CACHE: Optional["_BM25Index"] = None
+_RAG_LOCK = threading.Lock()
 
 
 # ── Knowledge Base Loading ─────────────────────────────────────────────────────
 
+def get_kb() -> dict:
+    """Return the parsed knowledge base JSON (lazily loaded singleton)."""
+    global _KB_CACHE
+    if _KB_CACHE is None:
+        with open(_KB_PATH, "r", encoding="utf-8") as f:
+            _KB_CACHE = json.load(f)
+    return _KB_CACHE
+
+
 def _load_kb() -> dict:
-    with open(_KB_PATH, "r") as f:
-        return json.load(f)
-
-
-_KB = _load_kb()
+    return get_kb()
 
 
 def _build_chunks(kb: dict) -> tuple[list[str], list[str]]:
@@ -82,40 +99,50 @@ def _build_chunks(kb: dict) -> tuple[list[str], list[str]]:
 
 # ── Vector Store (ChromaDB) ────────────────────────────────────────────────────
 
-def _build_vectorstore():
-    """Create or load the persistent ChromaDB collection.
+def get_vectorstore() -> tuple[chromadb.Collection, list[str], list[str]]:
+    """Create or load the persistent ChromaDB collection (lazily initialized singleton).
 
-    On first run, chunks and embeds the knowledge base (~5 s to download model).
-    On subsequent runs, loads the existing collection from .chroma_db/ instantly.
-    The embedding function is also used to **pre-warm** the model so the first
-    real query does not incur a cold-start penalty.
+    On first query, chunks and embeds the knowledge base.
+    On subsequent calls, reuses the cached collection instantly.
+    Thread-safe under concurrent requests.
     """
-    ef = embedding_functions.SentenceTransformerEmbeddingFunction(
-        model_name="all-MiniLM-L6-v2"
-    )
-    client = chromadb.PersistentClient(path=str(_CHROMA_PATH))
-    collection = client.get_or_create_collection(
-        name="autostream_kb",
-        embedding_function=ef,
-        metadata={"hnsw:space": "cosine"},
-    )
+    global _VECTORSTORE_CACHE
+    if _VECTORSTORE_CACHE is not None:
+        return _VECTORSTORE_CACHE
 
-    docs, ids = _build_chunks(_KB)
+    with _RAG_LOCK:
+        if _VECTORSTORE_CACHE is not None:
+            return _VECTORSTORE_CACHE
 
-    if collection.count() == 0:
-        collection.add(documents=docs, ids=ids)
-        print(f"[RAG] Vector store built: {len(docs)} chunks embedded → .chroma_db/")
-    else:
-        print(f"[RAG] Vector store loaded: {collection.count()} chunks from .chroma_db/")
+        ef = embedding_functions.SentenceTransformerEmbeddingFunction(
+            model_name="all-MiniLM-L6-v2"
+        )
+        client = chromadb.PersistentClient(path=str(_CHROMA_PATH))
+        collection = client.get_or_create_collection(
+            name="autostream_kb",
+            embedding_function=ef,
+            metadata={"hnsw:space": "cosine"},
+        )
 
-    # Pre-warm: embed a dummy query to load the model weights into RAM now.
-    collection.query(query_texts=["warm up"], n_results=1, include=["documents"])
-    print("[RAG] Embedding model pre-warmed ✓")
+        kb = get_kb()
+        docs, ids = _build_chunks(kb)
 
-    return collection, docs, ids
+        if collection.count() == 0:
+            collection.add(documents=docs, ids=ids)
+            logger.info("Vector store built: %d chunks embedded → %s", len(docs), _CHROMA_PATH)
+        else:
+            logger.info("Vector store loaded: %d chunks from %s", collection.count(), _CHROMA_PATH)
+
+        # Pre-warm: embed a dummy query to load the model weights into RAM now.
+        collection.query(query_texts=["warm up"], n_results=1, include=["documents"])
+        logger.info("Embedding model pre-warmed successfully.")
+
+        _VECTORSTORE_CACHE = (collection, docs, ids)
+        return _VECTORSTORE_CACHE
 
 
-_COLLECTION, _ALL_DOCS, _ALL_IDS = _build_vectorstore()
+def _build_vectorstore():
+    return get_vectorstore()
 
 
 # ── BM25 Sparse Index ──────────────────────────────────────────────────────────
@@ -123,11 +150,8 @@ _COLLECTION, _ALL_DOCS, _ALL_IDS = _build_vectorstore()
 class _BM25Index:
     """Lightweight BM25 index over the knowledge base chunks.
 
-    Built once at module load time from the same ``_ALL_DOCS`` list used by
+    Built once on first query from the same documents list used by
     ChromaDB, ensuring both retrieval paths operate over an identical corpus.
-
-    Tokenisation: simple whitespace split on lowercased text — adequate for a
-    small, structured knowledge base like this.
     """
 
     def __init__(self, docs: list[str], ids: list[str]) -> None:
@@ -147,7 +171,34 @@ class _BM25Index:
         return ranked[:top_k]
 
 
-_BM25 = _BM25Index(_ALL_DOCS, _ALL_IDS)
+def get_bm25_index() -> _BM25Index:
+    """Return the BM25 sparse index (lazily constructed thread-safe singleton)."""
+    global _BM25_CACHE
+    if _BM25_CACHE is not None:
+        return _BM25_CACHE
+
+    with _RAG_LOCK:
+        if _BM25_CACHE is not None:
+            return _BM25_CACHE
+        _, docs, ids = get_vectorstore()
+        _BM25_CACHE = _BM25Index(docs, ids)
+        return _BM25_CACHE
+
+
+# ── Module-level attribute access for backward compatibility ──────────────────
+
+def __getattr__(name: str):
+    if name == "_KB":
+        return get_kb()
+    elif name == "_COLLECTION":
+        return get_vectorstore()[0]
+    elif name == "_ALL_DOCS":
+        return get_vectorstore()[1]
+    elif name == "_ALL_IDS":
+        return get_vectorstore()[2]
+    elif name == "_BM25":
+        return get_bm25_index()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 # ── Reciprocal Rank Fusion ─────────────────────────────────────────────────────
@@ -222,14 +273,17 @@ async def retrieve_knowledge(
         A formatted string of up to ``top_k`` fused context chunks, or a
         fallback message when no chunks meet the relevance threshold.
     """
-    if _COLLECTION.count() == 0:
+    collection, _, _ = get_vectorstore()
+    bm25 = get_bm25_index()
+
+    if collection.count() == 0:
         return "No knowledge base context available."
 
-    n = min(top_k, _COLLECTION.count())
+    n = min(top_k, collection.count())
 
     # ── Dense retrieval (runs in thread pool to avoid blocking the event loop) ──
     def _dense_query() -> tuple[list[str], list[str], list[float]]:
-        results = _COLLECTION.query(
+        results = collection.query(
             query_texts=[query],
             n_results=n,
             include=["documents", "distances"],
@@ -251,7 +305,7 @@ async def retrieve_knowledge(
             dense_ranked_ids.append(doc_id)
 
     # ── Sparse retrieval (BM25 — pure Python, non-blocking) ───────────────────
-    sparse_results = _BM25.query(query, top_k=n)
+    sparse_results = bm25.query(query, top_k=n)
     sparse_id_to_doc: dict[str, str] = {doc_id: doc for doc_id, doc, _ in sparse_results}
     sparse_ranked_ids: list[str] = [doc_id for doc_id, _, _ in sparse_results]
 
@@ -302,15 +356,7 @@ def mock_lead_capture(name: str, email: str, platform: str) -> str:
     In production this would also POST to a real CRM API.
     """
     _append_lead_to_csv(name, email, platform)
-
-    print(f"\n{'='*55}")
-    print(f"  ✅  LEAD CAPTURED & SAVED TO leads.csv")
-    print(f"{'='*55}")
-    print(f"  Name     : {name}")
-    print(f"  Email    : {email}")
-    print(f"  Platform : {platform}")
-    print(f"  Saved to : {_LEADS_CSV}")
-    print(f"{'='*55}\n")
+    logger.info("Captured lead: %s <%s> on %s saved to %s", name, email, platform, _LEADS_CSV)
 
     return (
         f"✅ Lead captured successfully!\n"

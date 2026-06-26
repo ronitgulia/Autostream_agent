@@ -846,3 +846,34 @@ class TestLLMFactoryAndConfiguration:
             api_key="dummy-key",
             temperature=0.3,
         )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Lazy RAG Store & BM25 Singletons
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestLazyRAGInitialization:
+    def test_lazy_accessors_return_singletons(self):
+        import tools.tools as tools_mod
+
+        kb1 = tools_mod.get_kb()
+        kb2 = tools_mod.get_kb()
+        assert kb1 is kb2
+        assert "company" in kb1
+
+        vs1 = tools_mod.get_vectorstore()
+        vs2 = tools_mod.get_vectorstore()
+        assert vs1 is vs2
+
+        bm1 = tools_mod.get_bm25_index()
+        bm2 = tools_mod.get_bm25_index()
+        assert bm1 is bm2
+
+    def test_module_getattr_backwards_compatibility(self):
+        import tools.tools as tools_mod
+
+        assert tools_mod._KB is not None
+        assert tools_mod._COLLECTION is not None
+        assert isinstance(tools_mod._ALL_DOCS, list)
+        assert isinstance(tools_mod._ALL_IDS, list)
+        assert tools_mod._BM25 is not None
