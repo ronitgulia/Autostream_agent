@@ -20,5 +20,10 @@ chromadb>=0.5.0                 # Persistent local vector database
 sentence-transformers>=3.0.0    # all-MiniLM-L6-v2 local embedding model (no API key)
 rank-bm25>=0.2.2                # BM25 sparse retrieval for hybrid RRF reranking
 
+# ── Webhook & REST API Server ─────────────────────────────────────────────────
+fastapi>=0.110.0
+uvicorn>=0.28.0
+httpx>=0.27.0
+
 # ── Utilities ─────────────────────────────────────────────────────────────────
 python-dotenv>=1.0.0            # Load .env variables
