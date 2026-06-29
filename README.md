@@ -9,15 +9,20 @@
 
 ```
 autostream-agent/
-├── main.py                          # CLI entrypoint — run this to start the agent
+├── main.py                          # CLI entrypoint — token streaming terminal interface
+├── server.py                        # FastAPI server — WhatsApp Cloud API webhook & REST API
 ├── requirements.txt
-├── .env.example                     # Copy to .env and add your API key
+├── .env.example                     # Environment configuration template
 │
 ├── agent/
 │   └── agent.py                     # LangGraph graph definition (nodes + state)
 │
 ├── tools/
-│   └── tools.py                     # RAG retrieval + mock lead capture tool
+│   └── tools.py                     # Hybrid RAG (Chroma + BM25) + mock lead capture tool
+│
+├── tests/
+│   ├── test_agent.py                # Unit tests for state machine, RAG, and lead capture
+│   └── test_server.py               # Integration tests for FastAPI webhook & REST endpoints
 │
 └── knowledge_base/
     └── autostream_kb.json           # Local knowledge base (pricing, policies, FAQs)
@@ -131,54 +136,51 @@ The agent is built as a **directed state graph** with four nodes:
 
 ---
 
-##  WhatsApp Deployment via Webhooks
+##  WhatsApp Deployment via Webhooks & REST Server
 
-To deploy this agent on WhatsApp, the following architecture would be used:
+The repository includes a production-ready **FastAPI webhook server** (`server.py`) that implements the full Meta WhatsApp Cloud API flow and a standalone REST chat API.
 
-### Flow
+### Running the Server
+
+```bash
+# Start the webhook & REST server
+uvicorn server:app --host 0.0.0.0 --port 8000 --reload
+```
+
+### Endpoints
+
+* `GET /healthz`: Health status and active LLM configuration.
+* `GET /webhook`: Webhook verification challenge handshake for the Meta Developer Portal (`hub.challenge`).
+* `POST /webhook`: Webhook event receiver with `X-Hub-Signature-256` HMAC validation, message deduplication, and async LangGraph execution.
+* `POST /api/chat`: REST endpoint for web or mobile clients:
+  ```bash
+  curl -X POST http://localhost:8000/api/chat \
+    -H "Content-Type: application/json" \
+    -d '{"session_id": "user_123", "message": "What are your pricing plans?"}'
+  ```
+
+### Architecture Flow
 
 ```
 WhatsApp User
      │  (sends message)
      ▼
 WhatsApp Cloud API (Meta)
-     │  HTTP POST → Webhook
+     │  HTTP POST (with X-Hub-Signature-256)
      ▼
-Your Backend Server (FastAPI / Flask)
-  ├── Verifies webhook signature (X-Hub-Signature-256)
-  ├── Extracts message body + sender phone number
-  ├── Loads user's AgentState from a persistent store (Redis / DynamoDB)
-  ├── Calls graph.invoke(state) with the new HumanMessage
-  ├── Saves updated state back to the store (keyed by phone number)
-  └── Sends AI response back via WhatsApp Cloud API (POST /messages)
+FastAPI Server (server.py)
+  ├── Verifies HMAC SHA-256 signature against WHATSAPP_APP_SECRET
+  ├── Deduplicates incoming message ID (wamid)
+  ├── Acknowledges Meta immediately with 200 OK
+  ├── Dispatches background task:
+  │     ├── Retrieves/initializes user AgentState from SessionStore
+  │     ├── Invokes LangGraph agent state machine
+  │     ├── Persists updated AgentState for the phone number
+  │     └── Sends AI response back via WhatsApp Cloud API POST /messages
      │
      ▼
 WhatsApp User receives reply
 ```
-
-### Key Implementation Steps
-
-1. **Register a Webhook** at `https://your-server.com/webhook` in the Meta Developer Portal. Meta will send a `GET` request with a `hub.challenge` token that your server must echo back to verify ownership.
-
-2. **Handle Incoming Messages**: On each `POST` from Meta, parse the payload:
-   ```python
-   body = request.json()
-   phone = body["entry"][0]["changes"][0]["value"]["messages"][0]["from"]
-   text  = body["entry"][0]["changes"][0]["value"]["messages"][0]["text"]["body"]
-   ```
-
-3. **Persist State per User**: Use Redis with `phone` as the key to store and retrieve each user's `AgentState` (serialised as JSON) so that conversations remain coherent across multiple WhatsApp messages.
-
-4. **Reply via API**:
-   ```python
-   requests.post(
-       f"https://graph.facebook.com/v19.0/{PHONE_NUMBER_ID}/messages",
-       headers={"Authorization": f"Bearer {WHATSAPP_TOKEN}"},
-       json={"messaging_product": "whatsapp", "to": phone, "text": {"body": agent_reply}}
-   )
-   ```
-
-5. **Security**: Always verify `X-Hub-Signature-256` on incoming requests to prevent spoofing.
 
 ---
 
