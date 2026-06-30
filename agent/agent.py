@@ -235,6 +235,7 @@ class AgentState(BaseModel):
     lead: Lead = Lead()
     rag_context: str = ""
     consecutive_failures: int = 0
+    error_state: bool = False
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -457,15 +458,18 @@ async def detect_intent(state: AgentState) -> AgentState:
         # Circuit open: reset counter and surface error message.
         return state.model_copy(update={
             "consecutive_failures": 0,
+            "error_state": True,
             "messages": [AIMessage(content=circuit_msg)],
         })
 
     result = await _safe_detect_intent(state)
-    return state.model_copy(update={"intent": result.intent})
+    return state.model_copy(update={"intent": result.intent, "error_state": False})
 
 
-def route(state: AgentState) -> Literal["greeter", "rag_answer", "lead_capture"]:
+def route(state: AgentState) -> Literal["greeter", "rag_answer", "lead_capture", "__end__"]:
     """Route to the appropriate node based on intent and lead stage."""
+    if state.error_state:
+        return END
     if state.lead_stage in ("collecting", "done"):
         return "lead_capture"
     if state.intent == Intent.high_intent:
@@ -806,6 +810,7 @@ def build_graph() -> StateGraph:
             "greeter": "greeter",
             "rag_answer": "rag_answer",
             "lead_capture": "lead_capture",
+            END: END,
         },
     )
 
