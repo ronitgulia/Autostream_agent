@@ -34,7 +34,7 @@ from typing import Annotated, AsyncGenerator, Literal, List, Optional, Tuple
 
 from dotenv import load_dotenv
 from pydantic import BaseModel, EmailStr, field_validator, ConfigDict, ValidationError
-from langchain_core.messages import HumanMessage, AIMessage, SystemMessage, BaseMessage
+from langchain_core.messages import HumanMessage, AIMessage, SystemMessage, BaseMessage, RemoveMessage
 from langgraph.graph import StateGraph, END
 from langgraph.graph.message import add_messages
 
@@ -290,15 +290,14 @@ CONVERSATION:
 {history}"""
 
 
-async def _trim_messages(messages: List[BaseMessage]) -> List[BaseMessage]:
+async def _trim_messages(messages: List[BaseMessage]) -> Tuple[List[BaseMessage], List[BaseMessage]]:
     """Sliding-window context management.
 
-    Returns messages unchanged when len <= KEEP_LAST_N. Otherwise condenses
-    older turns into a single SystemMessage summary and appends the most recent
-    KEEP_LAST_N messages, keeping every LLM call within a predictable token budget.
+    Returns:
+        (context_msgs, state_updates)
     """
     if len(messages) <= KEEP_LAST_N:
-        return messages
+        return messages, []
 
     older = messages[:-KEEP_LAST_N]
     recent = messages[-KEEP_LAST_N:]
@@ -308,6 +307,10 @@ async def _trim_messages(messages: List[BaseMessage]) -> List[BaseMessage]:
         for m in older
         if isinstance(m, (HumanMessage, AIMessage))
     )
+    # Include previous summary content if it exists to maintain continuity
+    for m in older:
+        if isinstance(m, SystemMessage) and "Conversation Summary" in m.content:
+            history_text = m.content + "\n" + history_text
 
     llm = await _get_llm_async()
     summary_response = await _with_retry(
@@ -318,7 +321,11 @@ async def _trim_messages(messages: List[BaseMessage]) -> List[BaseMessage]:
     summary_msg = SystemMessage(
         content=f"[Conversation Summary — earlier turns]\n{summary_response.content}"
     )
-    return [summary_msg] + list(recent)
+    
+    state_updates = [RemoveMessage(id=m.id) for m in older if getattr(m, "id", None) is not None] + [summary_msg]
+    context_msgs = [summary_msg] + list(recent)
+    
+    return context_msgs, state_updates
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -489,7 +496,7 @@ mention you'd be happy to share pricing details or help them get started."""
 
 
 async def greeter_node(state: AgentState) -> AgentState:
-    context_msgs = await _trim_messages(state.messages)
+    context_msgs, state_updates = await _trim_messages(state.messages)
     llm = await _get_llm_async()
     try:
         response = await _with_retry(
@@ -500,7 +507,7 @@ async def greeter_node(state: AgentState) -> AgentState:
         )
         return state.model_copy(update={
             "consecutive_failures": 0,
-            "messages": [AIMessage(content=response.content)],
+            "messages": state_updates + [AIMessage(content=response.content)],
         })
     except Exception as exc:
         logger.error("[greeter] Failed after retries: %s", exc)
@@ -538,10 +545,11 @@ async def rag_answer_node(state: AgentState) -> AgentState:
     )
 
     # ── Parallel fetch: RAG context + trimmed message history ─────────────────
-    context, context_msgs = await asyncio.gather(
+    context, trim_result = await asyncio.gather(
         retrieve_knowledge(last_human),
         _trim_messages(state.messages),
     )
+    context_msgs, state_updates = trim_result
 
     llm = await _get_llm_async()
     try:
@@ -554,7 +562,7 @@ async def rag_answer_node(state: AgentState) -> AgentState:
         return state.model_copy(update={
             "consecutive_failures": 0,
             "rag_context": context,
-            "messages": [AIMessage(content=response.content)],
+            "messages": state_updates + [AIMessage(content=response.content)],
         })
     except Exception as exc:
         logger.error("[rag_answer] Failed after retries: %s", exc)
@@ -605,7 +613,7 @@ async def lead_capture_node(state: AgentState) -> AgentState:
       5. Fires mock_lead_capture() once all three fields are present and valid.
     """
     if state.lead_stage == "done":
-        context_msgs = await _trim_messages(state.messages)
+        context_msgs, state_updates = await _trim_messages(state.messages)
         llm = await _get_llm_async()
         try:
             response = await _with_retry(
@@ -619,7 +627,7 @@ async def lead_capture_node(state: AgentState) -> AgentState:
             )
             return state.model_copy(update={
                 "consecutive_failures": 0,
-                "messages": [AIMessage(content=response.content)],
+                "messages": state_updates + [AIMessage(content=response.content)],
             })
         except Exception as exc:
             logger.error("[lead_capture/done] Failed after retries: %s", exc)

@@ -364,19 +364,23 @@ class TestTrimMessages:
 
     def test_short_history_returned_unchanged(self):
         msgs = self._make_convo(KEEP_LAST_N // 2)
-        result = asyncio.run(_trim_messages(msgs))
+        result, updates = asyncio.run(_trim_messages(msgs))
         assert result == msgs
+        assert updates == []
 
     def test_exact_threshold_returned_unchanged(self):
         msgs = self._make_convo(KEEP_LAST_N // 2)
         while len(msgs) < KEEP_LAST_N:
             msgs.append(HumanMessage(content="extra"))
         assert len(msgs) == KEEP_LAST_N
-        result = asyncio.run(_trim_messages(msgs))
+        result, updates = asyncio.run(_trim_messages(msgs))
         assert result == msgs
+        assert updates == []
 
     def test_long_history_triggers_summary(self):
         msgs = self._make_convo(KEEP_LAST_N)
+        for i, m in enumerate(msgs):
+            m.id = f"test_id_{i}"
 
         mock_response = MagicMock()
         mock_response.content = "User asked about pricing and features."
@@ -386,12 +390,13 @@ class TestTrimMessages:
 
         with patch("agent.agent._get_llm", return_value=mock_llm), \
              patch("agent.agent._LLM_INSTANCE", mock_llm):
-            result = asyncio.run(_trim_messages(msgs))
+            result, updates = asyncio.run(_trim_messages(msgs))
 
         assert isinstance(result[0], SystemMessage)
         assert "Conversation Summary" in result[0].content
         assert len(result) == KEEP_LAST_N + 1
         assert result[1:] == msgs[-KEEP_LAST_N:]
+        assert len(updates) == len(msgs[:-KEEP_LAST_N]) + 1
 
     def test_summary_content_included_in_system_message(self):
         msgs = self._make_convo(KEEP_LAST_N + 2)
@@ -404,7 +409,7 @@ class TestTrimMessages:
 
         with patch("agent.agent._get_llm", return_value=mock_llm), \
              patch("agent.agent._LLM_INSTANCE", mock_llm):
-            result = asyncio.run(_trim_messages(msgs))
+            result, updates = asyncio.run(_trim_messages(msgs))
 
         assert "Summary: user discussed refund policy." in result[0].content
 
