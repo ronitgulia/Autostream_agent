@@ -17,7 +17,7 @@ from unittest.mock import patch, MagicMock, AsyncMock
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from fastapi.testclient import TestClient
-from langchain_core.messages import HumanMessage, AIMessage
+from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
 
 from server import (
     app,
@@ -25,6 +25,8 @@ from server import (
     MessageDeduplicator,
     verify_meta_signature,
     WHATSAPP_VERIFY_TOKEN,
+    state_to_dict,
+    state_from_dict,
 )
 from agent.agent import AgentState, Intent, Lead
 
@@ -181,3 +183,89 @@ class TestRestChatApi:
         assert data["reply"] == "Pro plan is $79/month."
         assert data["intent"] == "product_inquiry"
         assert data["lead_stage"] == "none"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# State Serialization & Distributed Session Persistence
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestStateSerializationAndRedisStore:
+    def test_state_serialization_roundtrip(self):
+        original_state = AgentState(
+            intent=Intent.high_intent,
+            lead_stage="collecting",
+            lead=Lead(
+                name="Sarah Connor",
+                email="sarah@example.com",
+                platform="YouTube",
+            ),
+            messages=[
+                SystemMessage(content="You are an AutoStream agent."),
+                HumanMessage(content="Hi, I want to edit video for YouTube."),
+                AIMessage(content="Awesome, what is your email address?"),
+            ],
+        )
+
+        serialized = state_to_dict(original_state)
+        assert isinstance(serialized, dict)
+        assert serialized["intent"] == "high_intent"
+        assert serialized["lead_stage"] == "collecting"
+        assert serialized["lead"]["name"] == "Sarah Connor"
+        assert len(serialized["messages"]) == 3
+        assert serialized["messages"][0]["role"] == "system"
+        assert serialized["messages"][1]["role"] == "human"
+        assert serialized["messages"][2]["role"] == "ai"
+
+        restored_state = state_from_dict(serialized)
+        assert restored_state.intent == Intent.high_intent
+        assert restored_state.lead_stage == "collecting"
+        assert restored_state.lead.name == "Sarah Connor"
+        assert restored_state.lead.email == "sarah@example.com"
+        assert restored_state.lead.platform == "YouTube"
+        assert len(restored_state.messages) == 3
+        assert isinstance(restored_state.messages[0], SystemMessage)
+        assert isinstance(restored_state.messages[1], HumanMessage)
+        assert isinstance(restored_state.messages[2], AIMessage)
+        assert restored_state.messages[2].content == "Awesome, what is your email address?"
+
+    def test_redis_store_get_and_save(self):
+        mock_redis = MagicMock()
+        store = SessionStore(redis_url=None)
+        store._redis_client = mock_redis
+
+        test_state = AgentState(
+            intent=Intent.product_inquiry,
+            lead=Lead(name="John Doe"),
+            messages=[HumanMessage(content="Hello")],
+        )
+
+        # Test save_state writes to redis with setex
+        store.save_state("session_123", test_state)
+        mock_redis.setex.assert_called_once()
+        args, _ = mock_redis.setex.call_args
+        assert args[0] == "autostream:session:session_123"
+        payload_dict = json.loads(args[2])
+        assert payload_dict["intent"] == "product_inquiry"
+        assert payload_dict["lead"]["name"] == "John Doe"
+
+        # Test get_state reads from redis
+        mock_redis.get.return_value = json.dumps(state_to_dict(test_state))
+        loaded = store.get_state("session_123")
+        assert loaded.lead.name == "John Doe"
+        assert loaded.intent == Intent.product_inquiry
+
+    def test_redis_store_fallback_on_failure(self):
+        mock_redis = MagicMock()
+        mock_redis.get.side_effect = ConnectionError("Redis unreachable")
+        mock_redis.setex.side_effect = ConnectionError("Redis unreachable")
+
+        store = SessionStore(redis_url=None)
+        store._redis_client = mock_redis
+
+        # State should be gracefully saved and retrieved from in-memory fallback
+        state = AgentState(lead=Lead(name="Fallback User"))
+        store.save_state("session_fail", state)
+
+        retrieved = store.get_state("session_fail")
+        assert retrieved.lead.name == "Fallback User"
+
