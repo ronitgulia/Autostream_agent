@@ -30,7 +30,7 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, Request, Response, HTTPException, BackgroundTasks, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-from langchain_core.messages import HumanMessage, AIMessage
+from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
 
 from agent.agent import build_graph, AgentState
 
@@ -50,17 +50,61 @@ WHATSAPP_PHONE_NUMBER_ID = os.getenv("WHATSAPP_PHONE_NUMBER_ID", "")
 WHATSAPP_VERIFY_TOKEN = os.getenv("WHATSAPP_VERIFY_TOKEN", "autostream_verify_token")
 WHATSAPP_APP_SECRET = os.getenv("WHATSAPP_APP_SECRET", "")
 GRAPH_API_VERSION = os.getenv("GRAPH_API_VERSION", "v19.0")
+REDIS_URL = os.getenv("REDIS_URL", "")
+REDIS_SESSION_TTL_SECONDS = int(os.getenv("REDIS_SESSION_TTL_SECONDS", "86400"))
+
+
+# ── State Serialization Helpers ────────────────────────────────────────────────
+
+def state_to_dict(state: AgentState) -> dict:
+    """Serialize an AgentState object into a JSON-compatible dictionary."""
+    data = state.model_dump(exclude={"messages"})
+    messages_data = []
+    for msg in state.messages:
+        role = "human" if isinstance(msg, HumanMessage) else "ai" if isinstance(msg, AIMessage) else "system"
+        messages_data.append({"role": role, "content": msg.content})
+    data["messages"] = messages_data
+    return data
+
+
+def state_from_dict(data: dict) -> AgentState:
+    """Deserialize a dictionary back into an AgentState instance."""
+    messages = []
+    for m in data.get("messages", []):
+        role = m.get("role", "human")
+        content = m.get("content", "")
+        if role == "ai":
+            messages.append(AIMessage(content=content))
+        elif role == "system":
+            messages.append(SystemMessage(content=content))
+        else:
+            messages.append(HumanMessage(content=content))
+
+    state_data = {k: v for k, v in data.items() if k != "messages"}
+    return AgentState(messages=messages, **state_data)
 
 
 # ── Session State Persistence & Locks ──────────────────────────────────────────
 
 class SessionStore:
-    """Thread-safe in-memory session store with LRU eviction and per-user locking."""
+    """Thread-safe session store with in-memory LRU and optional Redis persistence."""
 
-    def __init__(self, max_sessions: int = 10000) -> None:
+    def __init__(self, max_sessions: int = 10000, redis_url: Optional[str] = None) -> None:
         self._sessions: OrderedDict[str, AgentState] = OrderedDict()
         self._locks: Dict[str, asyncio.Lock] = {}
         self._max_sessions = max_sessions
+        self._redis_url = redis_url or REDIS_URL
+        self._redis_client = None
+
+        if self._redis_url:
+            try:
+                import redis
+                self._redis_client = redis.Redis.from_url(self._redis_url, decode_responses=True)
+                self._redis_client.ping()
+                logger.info("Connected to distributed Redis session store at %s", self._redis_url)
+            except Exception as exc:
+                logger.warning("Redis unavailable (%s); falling back to in-memory store.", exc)
+                self._redis_client = None
 
     def get_lock(self, session_id: str) -> asyncio.Lock:
         if session_id not in self._locks:
@@ -68,14 +112,34 @@ class SessionStore:
         return self._locks[session_id]
 
     def get_state(self, session_id: str) -> AgentState:
+        if self._redis_client:
+            try:
+                raw = self._redis_client.get(f"autostream:session:{session_id}")
+                if raw:
+                    return state_from_dict(json.loads(raw))
+            except Exception as exc:
+                logger.warning("Failed to fetch state from Redis for %s: %s", session_id, exc)
+
         if session_id in self._sessions:
             self._sessions.move_to_end(session_id)
             return self._sessions[session_id]
+
         new_state = AgentState()
         self.save_state(session_id, new_state)
         return new_state
 
     def save_state(self, session_id: str, state: AgentState) -> None:
+        if self._redis_client:
+            try:
+                payload = json.dumps(state_to_dict(state))
+                self._redis_client.setex(
+                    f"autostream:session:{session_id}",
+                    REDIS_SESSION_TTL_SECONDS,
+                    payload,
+                )
+            except Exception as exc:
+                logger.warning("Failed to persist state to Redis for %s: %s", session_id, exc)
+
         self._sessions[session_id] = state
         self._sessions.move_to_end(session_id)
         if len(self._sessions) > self._max_sessions:
@@ -262,6 +326,7 @@ async def health_check():
         "llm_provider": os.getenv("LLM_PROVIDER", "anthropic"),
         "llm_model": os.getenv("LLM_MODEL", "provider-default"),
         "whatsapp_configured": bool(WHATSAPP_TOKEN and WHATSAPP_PHONE_NUMBER_ID),
+        "redis_connected": bool(_SESSION_STORE._redis_client is not None),
     }
 
 
