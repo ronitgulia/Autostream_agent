@@ -1,0 +1,86 @@
+{
+  "scenarios": [
+    {
+      "id": "curious_creator",
+      "name": "Curious Creator Journey",
+      "description": "User inquires about pricing and features before committing to sign up.",
+      "expected_final_intent": "high_intent",
+      "expected_lead_completion": true,
+      "dialog": [
+        {
+          "role": "user",
+          "message": "Hi there! What are the pricing options for AutoStream?",
+          "expected_intent": "product_inquiry"
+        },
+        {
+          "role": "user",
+          "message": "Does the Pro plan include auto-captions and 4K exporting?",
+          "expected_intent": "product_inquiry"
+        },
+        {
+          "role": "user",
+          "message": "I'd like to try it out! My name is Jordan, email jordan.stream@example.com, and I edit on YouTube.",
+          "expected_intent": "high_intent"
+        }
+      ]
+    },
+    {
+      "id": "skeptical_evaluator",
+      "name": "Skeptical Evaluator with Flow Interruption",
+      "description": "User starts signing up, interrupts with a technical question about refund policies, and completes sign up.",
+      "expected_final_intent": "high_intent",
+      "expected_lead_completion": true,
+      "dialog": [
+        {
+          "role": "user",
+          "message": "I want to sign up for AutoStream Pro.",
+          "expected_intent": "high_intent"
+        },
+        {
+          "role": "user",
+          "message": "Wait, before I give my details, what is your refund policy if it doesn't work?",
+          "expected_intent": "product_inquiry"
+        },
+        {
+          "role": "user",
+          "message": "Good to know. I'm Marcus Vance, marcus@vancestudios.io, editing for TikTok and YouTube.",
+          "expected_intent": "high_intent"
+        }
+      ]
+    },
+    {
+      "id": "high_intent_direct",
+      "name": "Direct One-Shot Lead Conversion",
+      "description": "High intent customer provides all requisite lead capture fields in one turn.",
+      "expected_final_intent": "high_intent",
+      "expected_lead_completion": true,
+      "dialog": [
+        {
+          "role": "user",
+          "message": "Sign me up! Name: Elena Rostova, Email: elena@streamers.net, Platform: Twitch.",
+          "expected_intent": "high_intent"
+        }
+      ]
+    },
+    {
+      "id": "casual_greeter",
+      "name": "Casual Greeting and Exploration",
+      "description": "Casual visitor saying hello and asking what the bot does.",
+      "expected_final_intent": "product_inquiry",
+      "expected_lead_completion": false,
+      "dialog": [
+        {
+          "role": "user",
+          "message": "Hey! Anyone there?",
+          "expected_intent": "greeting"
+        },
+        {
+          "role": "user",
+          "message": "What is AutoStream?",
+          "expected_intent": "product_inquiry"
+        }
+      ]
+    }
+  ]
+}
+
