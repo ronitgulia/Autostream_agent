@@ -12,6 +12,8 @@ autostream-agent/
 ├── main.py                          # CLI entrypoint — token streaming terminal interface
 ├── server.py                        # FastAPI server — WhatsApp Cloud API webhook & REST API
 ├── requirements.txt
+├── Dockerfile                       # Multi-stage hardened production Docker container
+├── docker-compose.yml               # Service orchestration (agent + Redis 7)
 ├── .env.example                     # Environment configuration template
 │
 ├── agent/
@@ -20,9 +22,17 @@ autostream-agent/
 ├── tools/
 │   └── tools.py                     # Hybrid RAG (Chroma + BM25) + mock lead capture tool
 │
+├── eval/
+│   ├── scenarios.json               # Multi-turn persona dialogue test dataset
+│   └── benchmark.py                 # Automated evaluation harness & latency metrics
+│
 ├── tests/
 │   ├── test_agent.py                # Unit tests for state machine, RAG, and lead capture
-│   └── test_server.py               # Integration tests for FastAPI webhook & REST endpoints
+│   ├── test_server.py               # Integration tests for FastAPI webhook & Redis session store
+│   └── test_benchmark.py            # Unit tests for benchmark runner & persona simulators
+│
+├── .github/workflows/
+│   └── ci.yml                       # Multi-python CI matrix (3.10 - 3.13) + flake8 linting
 │
 └── knowledge_base/
     └── autostream_kb.json           # Local knowledge base (pricing, policies, FAQs)
@@ -181,6 +191,70 @@ FastAPI Server (server.py)
      ▼
 WhatsApp User receives reply
 ```
+
+---
+
+## 🐳 Docker & Distributed Session Storage
+
+AutoStream Agent is containerized with multi-stage build caching, non-root security hardening, and distributed Redis state persistence.
+
+### Run with Docker Compose
+
+Spin up both the FastAPI Agent server and a dedicated Redis 7 session store with a single command:
+
+```bash
+docker compose up -d --build
+```
+
+- **Agent Server**: Accessible on port `8000` with container healthchecks at `http://localhost:8000/healthz`.
+- **Redis Session Store**: Accessible on port `6379`.
+- **Automatic Fallback**: If Redis is not configured or temporarily unreachable, `SessionStore` automatically fails over to an in-memory LRU cache with zero downtime.
+
+---
+
+## 📊 Evaluation & Persona Benchmarking
+
+To ensure reliability, intent accuracy, and lead conversion resilience across multi-turn interactions, the repository provides an automated simulation benchmark suite.
+
+### Running the Benchmark
+
+```bash
+# Fast offline simulation (ideal for CI, no API keys required):
+python eval/benchmark.py --mock-llm
+
+# Live evaluation against configured LLMs with Markdown export:
+python eval/benchmark.py --scenarios eval/scenarios.json --output benchmark_report.md
+```
+
+### Simulated Persona Scenarios (`eval/scenarios.json`)
+
+1. **Curious Creator**: Multi-turn pricing and feature inquiry followed by seamless lead capture.
+2. **Skeptical Evaluator (Interruption Recovery)**: User pauses lead capture mid-flow to ask about refund policies. The agent answers via hybrid RAG and gracefully resumes collection.
+3. **Direct Conversion**: One-shot lead submission with complete contact details.
+4. **Casual Greeter**: Low-intent exploration and product overview.
+
+Metrics measured:
+- **Scenario Pass Rate (%)**: Percentage of multi-turn scenarios meeting expected final intent and lead capture criteria.
+- **Intent Accuracy (%)**: Turn-by-turn intent classification precision.
+- **Latency (ms)**: Turn latency, average duration, and P95 latency.
+
+---
+
+## 🧪 Testing & CI/CD
+
+Run the comprehensive test suite across unit, server integration, and evaluation components:
+
+```bash
+# Run all unit and integration tests
+pytest -v
+
+# Run specific test suites
+pytest tests/test_agent.py -v       # Graph routing, RAG, and memory tests
+pytest tests/test_server.py -v      # Webhook, HMAC auth, and Redis store tests
+pytest tests/test_benchmark.py -v   # Benchmark runner and simulation tests
+```
+
+Continuous integration is enforced via **GitHub Actions** across a multi-python matrix (`3.10`, `3.11`, `3.12`, `3.13`) alongside flake8 linting on every push and pull request.
 
 ---
 
